@@ -17,7 +17,6 @@
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/tiling_api.h"
-#include "../../sparse_kv_plan/op_kernel/sparse_kv_plan_config.h"
 #include "../op_kernel/quant_lightning_indexer_sparse_kv_template_tiling_key.h"
 
 namespace optiling {
@@ -38,12 +37,18 @@ constexpr uint32_t KV_BLOCK_TABLE_INDEX = 12U;
 constexpr uint32_t ACTIVE_ROWS_INDEX = 13U;
 constexpr uint32_t LAST_REQ_IDS_INDEX = 14U;
 constexpr uint32_t SLOT_TO_TOKEN_INDEX = 15U;
-constexpr uint32_t LRU_SLOTS_INDEX = 16U;
-constexpr uint32_t CURRENT_SLOTS_INDEX = 17U;
-constexpr uint32_t MISS_COUNT_INDEX = 18U;
-constexpr uint32_t MISS_TOKENS_INDEX = 19U;
-constexpr uint32_t MISS_SLOTS_INDEX = 20U;
-constexpr uint32_t COMPACT_WORKSPACE_INDEX = 21U;
+constexpr uint32_t PRIORITY_INDEX = 16U;
+constexpr uint32_t FREE_MASK_INDEX = 17U;
+constexpr uint32_t FREE_STACK_INDEX = 18U;
+constexpr uint32_t FREE_COUNT_INDEX = 19U;
+constexpr uint32_t CLOCK_INDEX = 20U;
+constexpr uint32_t CURRENT_SLOTS_INDEX = 21U;
+constexpr uint32_t MISS_COUNT_INDEX = 22U;
+constexpr uint32_t MISS_TOKENS_INDEX = 23U;
+constexpr uint32_t MISS_SLOTS_INDEX = 24U;
+constexpr uint32_t TOKEN_TO_SLOT_INDEX = 25U;
+constexpr uint32_t STATUS_INDEX = 26U;
+constexpr uint32_t RESIDENT_END_INDEX = 27U;
 constexpr uint32_t OUTPUT_INDEX = 0U;
 
 constexpr uint32_t ATTR_QUERY_QUANT_MODE_INDEX = 0U;
@@ -61,14 +66,13 @@ constexpr uint32_t ATTR_MAX_TOKEN_INDEX = 11U;
 constexpr uint32_t ATTR_PLAN_BLOCK_SIZE_INDEX = 12U;
 constexpr uint32_t ATTR_HOST_NUM_BLOCKS_INDEX = 13U;
 
+constexpr uint32_t ATTR_MAX_QUERIES_INDEX = 14U;
+
 constexpr uint32_t HEADS = 32U;
 constexpr uint32_t HEAD_DIM = 128U;
 constexpr uint32_t BLOCK_SIZE = 128U;
 constexpr int32_t SPARSE_MODE = 3;
 constexpr int64_t UNBOUNDED_TOKEN = std::numeric_limits<int64_t>::max();
-
-static_assert(qli_sparse_kv_contract::SCAN_BYTES == sparse_kv_plan_cfg::PLAN_SCAN_BYTES);
-static_assert(qli_sparse_kv_contract::ROW_UB_LIMIT_BYTES == sparse_kv_plan_cfg::PLAN_ROW_UB_LIMIT_BYTES);
 
 ge::graphStatus Fail(gert::TilingContext* context, const char* message) {
   OP_LOGE(context->GetNodeName(), "%s", message);
@@ -219,7 +223,7 @@ ge::graphStatus ValidateFixedIndexer(gert::TilingContext* context, QuantLightnin
       sparseCount == nullptr || sparseMode == nullptr || preTokens == nullptr || nextTokens == nullptr ||
       keyStride == nullptr || keyScaleStride == nullptr || capacity == nullptr || maxToken == nullptr ||
       planBlockSize == nullptr || hostNumBlocks == nullptr) {
-    return Fail(context, "fixed QLI requires all fourteen attributes");
+    return Fail(context, "fixed QLI indexer/pool attributes are missing");
   }
   if (*queryQuantMode != 0 || *keyQuantMode != 0 || std::strcmp(queryLayout, "TND") != 0 ||
       std::strcmp(keyLayout, "PA_BSND") != 0 || *sparseCount != static_cast<int32_t>(qli_sparse_kv_contract::TOPK) ||
@@ -245,69 +249,53 @@ ge::graphStatus ValidateFixedIndexer(gert::TilingContext* context, QuantLightnin
   info.maxToken = *maxToken;
   info.maxRequests = batchSize;
   info.hostNumBlocks = *hostNumBlocks;
-  info.planner = qli_sparse_kv_contract::ComputePlannerSizing(info.capacity, info.tSize);
+  const int64_t* maxQueries = attrs->GetInt(ATTR_MAX_QUERIES_INDEX);
+  if (maxQueries == nullptr || *maxQueries < 1 || *maxQueries > qli_sparse_kv_contract::MAX_QUERY_ROWS ||
+      info.capacity < *maxQueries * qli_sparse_kv_contract::TOPK ||
+      info.capacity > qli_sparse_kv_contract::MAX_CAPACITY || info.capacity % BLOCK_SIZE != 0 ||
+      info.hostNumBlocks > std::numeric_limits<int32_t>::max() ||
+      info.maxRequests > std::numeric_limits<int32_t>::max() ||
+      info.tSize > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+    return Fail(context, "request pool must cover max_queries*2048 with 1..16 query rows");
+  }
+  info.maxQueries = static_cast<int32_t>(*maxQueries);
   return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus ValidatePlanner(gert::TilingContext* context, QuantLightningIndexerSparseKvInfo& info) {
-  constexpr uint32_t indices[] = {
-      REQ_IDS_INDEX,     STABLE_PREFIX_LENS_INDEX, VISIBLE_SEQ_LENS_INDEX, TOKEN_TO_REQ_INDEX,     KV_BLOCK_TABLE_INDEX,
-      ACTIVE_ROWS_INDEX, LAST_REQ_IDS_INDEX,       SLOT_TO_TOKEN_INDEX,    LRU_SLOTS_INDEX,        CURRENT_SLOTS_INDEX,
-      MISS_COUNT_INDEX,  MISS_TOKENS_INDEX,        MISS_SLOTS_INDEX,       COMPACT_WORKSPACE_INDEX};
-  constexpr ge::DataType types[] = {ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-                                    ge::DT_INT32, ge::DT_INT64, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32,
-                                    ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT32};
-  const gert::StorageShape* shapes[sizeof(indices) / sizeof(indices[0])]{};
-  for (size_t index = 0; index < sizeof(indices) / sizeof(indices[0]); ++index) {
-    shapes[index] = context->GetInputShape(indices[index]);
-    if (shapes[index] == nullptr || !HasDataType(context, indices[index], types[index])) {
-      return Fail(context, "planner inputs require their fixed shapes and integer dtypes");
+  const int64_t b = info.maxRequests, r = info.tSize, c = info.capacity;
+  const int64_t unionSize = info.maxQueries * qli_sparse_kv_contract::TOPK;
+  const auto* tableShape = context->GetInputShape(KV_BLOCK_TABLE_INDEX);
+  if (tableShape == nullptr || tableShape->GetOriginShape().GetDimNum() != 2U ||
+      tableShape->GetOriginShape().GetDim(1) <= 0 ||
+      tableShape->GetOriginShape().GetDim(1) > std::numeric_limits<int32_t>::max()) {
+    return Fail(context, "invalid request page table");
+  }
+  info.maxNumBlocks = tableShape->GetOriginShape().GetDim(1);
+  struct Input { uint32_t index; ge::DataType type; int64_t rows; int64_t cols; };
+  const Input inputs[] = {
+      {REQ_IDS_INDEX, ge::DT_INT64, b, 0}, {STABLE_PREFIX_LENS_INDEX, ge::DT_INT32, r, 0},
+      {VISIBLE_SEQ_LENS_INDEX, ge::DT_INT32, r, 0}, {TOKEN_TO_REQ_INDEX, ge::DT_INT32, r, 0},
+      {KV_BLOCK_TABLE_INDEX, ge::DT_INT32, b, info.maxNumBlocks}, {ACTIVE_ROWS_INDEX, ge::DT_INT32, 1, 0},
+      {LAST_REQ_IDS_INDEX, ge::DT_INT64, b, 0}, {SLOT_TO_TOKEN_INDEX, ge::DT_INT32, b, c},
+      {PRIORITY_INDEX, ge::DT_INT64, b, c}, {FREE_MASK_INDEX, ge::DT_INT32, b, c},
+      {FREE_STACK_INDEX, ge::DT_INT32, b, c}, {FREE_COUNT_INDEX, ge::DT_INT32, b, 0},
+      {CLOCK_INDEX, ge::DT_INT64, b, 0}, {CURRENT_SLOTS_INDEX, ge::DT_INT32, r, qli_sparse_kv_contract::TOPK},
+      {MISS_COUNT_INDEX, ge::DT_INT32, b, 0}, {MISS_TOKENS_INDEX, ge::DT_INT32, b, unionSize},
+      {MISS_SLOTS_INDEX, ge::DT_INT32, b, unionSize}, {TOKEN_TO_SLOT_INDEX, ge::DT_INT32, b, info.maxToken},
+      {STATUS_INDEX, ge::DT_INT32, b, 0}, {RESIDENT_END_INDEX, ge::DT_INT32, b, 0}};
+  for (const auto& input : inputs) {
+    const auto* storage = context->GetInputShape(input.index);
+    if (storage == nullptr || !HasDataType(context, input.index, input.type)) {
+      return Fail(context, "missing request state or wrong dtype");
+    }
+    const auto& shape = storage->GetOriginShape();
+    const int64_t dims[] = {input.rows, input.cols};
+    if (!ShapeEquals(shape, dims, input.cols == 0 ? 1 : 2) ||
+        !IsContiguous(context, input.index, shape)) {
+      return Fail(context, "request state shape/stride mismatch");
     }
   }
-  const gert::Shape& req = shapes[0]->GetOriginShape();
-  const gert::Shape& stable = shapes[1]->GetOriginShape();
-  const gert::Shape& visible = shapes[2]->GetOriginShape();
-  const gert::Shape& tokenToReq = shapes[3]->GetOriginShape();
-  const gert::Shape& blockTable = shapes[4]->GetOriginShape();
-  const gert::Shape& activeRows = shapes[5]->GetOriginShape();
-  const gert::Shape& lastReq = shapes[6]->GetOriginShape();
-  const gert::Shape& slotToToken = shapes[7]->GetOriginShape();
-  const gert::Shape& lruSlots = shapes[8]->GetOriginShape();
-  const gert::Shape& currentSlots = shapes[9]->GetOriginShape();
-  const gert::Shape& missCount = shapes[10]->GetOriginShape();
-  const gert::Shape& missTokens = shapes[11]->GetOriginShape();
-  const gert::Shape& missSlots = shapes[12]->GetOriginShape();
-  const gert::Shape& workspace = shapes[13]->GetOriginShape();
-  const bool ranksValid = req.GetDimNum() == 1U && stable.GetDimNum() == 1U && visible.GetDimNum() == 1U &&
-                          tokenToReq.GetDimNum() == 1U && blockTable.GetDimNum() == 2U &&
-                          activeRows.GetDimNum() <= 1U && lastReq.GetDimNum() == 1U && slotToToken.GetDimNum() == 2U &&
-                          lruSlots.GetDimNum() == 2U && currentSlots.GetDimNum() == 2U && missCount.GetDimNum() == 1U &&
-                          missTokens.GetDimNum() == 2U && missSlots.GetDimNum() == 2U && workspace.GetDimNum() == 2U;
-  if (!ranksValid) {
-    return Fail(context, "planner input rank mismatch");
-  }
-  const bool activeRowsHasValue = activeRows.GetDimNum() == 0U || activeRows.GetDim(0) >= 1;
-  if (req.GetDim(0) != info.maxRequests ||
-      !qli_sparse_kv_contract::PlannerBlockTableShapeIsValid(blockTable.GetDim(0), blockTable.GetDim(1),
-                                                             info.maxRequests) ||
-      stable.GetDim(0) < info.tSize || visible.GetDim(0) < info.tSize || tokenToReq.GetDim(0) < info.tSize ||
-      !activeRowsHasValue || lastReq.GetDim(0) < info.tSize || slotToToken.GetDim(0) < info.tSize ||
-      slotToToken.GetDim(1) != info.capacity || lruSlots.GetDim(0) < info.tSize ||
-      lruSlots.GetDim(1) != info.capacity || currentSlots.GetDim(0) < info.tSize ||
-      currentSlots.GetDim(1) != qli_sparse_kv_contract::TOPK || missCount.GetDim(0) < info.tSize ||
-      missTokens.GetDim(0) < info.tSize || missTokens.GetDim(1) != qli_sparse_kv_contract::TOPK ||
-      missSlots.GetDim(0) < info.tSize || missSlots.GetDim(1) != qli_sparse_kv_contract::TOPK ||
-      !qli_sparse_kv_contract::CompactWorkspaceShapeIsValid(workspace.GetDim(0), workspace.GetDim(1), info.planner,
-                                                            info.tSize)) {
-    return Fail(context, "planner input shape does not satisfy the fixed row-storage contract");
-  }
-  constexpr size_t mutableShapeOffsets[] = {6U, 7U, 8U, 9U, 10U, 11U, 12U, 13U};
-  for (size_t offset : mutableShapeOffsets) {
-    if (!IsContiguous(context, indices[offset], shapes[offset]->GetOriginShape())) {
-      return Fail(context, "planner mutable inputs must be contiguous");
-    }
-  }
-  info.maxNumBlocks = blockTable.GetDim(1);
   return ge::GRAPH_SUCCESS;
 }
 
@@ -324,7 +312,7 @@ ge::graphStatus WriteTiling(gert::TilingContext* context, const QuantLightningIn
   context->SetBlockDim(blockDim);
   context->GetWorkspaceSizes(1)[0] = WorkspaceSize(platform, info, aicCount);
 
-  if (context->SetDynUBufSize(info.planner.dynamicUbBytes) != ge::GRAPH_SUCCESS) {
+  if (context->SetDynUBufSize(qli_sparse_kv_contract::DynamicUbBytes(info.tSize)) != ge::GRAPH_SUCCESS) {
     return Fail(context, "failed to set fixed fused dynamic UB size");
   }
 
@@ -342,8 +330,6 @@ ge::graphStatus WriteTiling(gert::TilingContext* context, const QuantLightningIn
   tiling.set_blockSize(BLOCK_SIZE);
   tiling.set_maxBlockNumPerBatch(info.maxBlockNumPerBatch);
   tiling.set_sparseMode(SPARSE_MODE);
-  tiling.set_hashCapacity(info.planner.hashCapacity);
-  tiling.set_workspaceRowElements(info.planner.workspaceRowElements);
   tiling.set_maxRows(info.tSize);
   tiling.set_topk(qli_sparse_kv_contract::TOPK);
   tiling.set_capacity(info.capacity);
@@ -352,7 +338,7 @@ ge::graphStatus WriteTiling(gert::TilingContext* context, const QuantLightningIn
   tiling.set_maxNumBlocks(info.maxNumBlocks);
   tiling.set_hostNumBlocks(info.hostNumBlocks);
   tiling.set_planBlockSize(BLOCK_SIZE);
-  tiling.set_planLocalMemoryBytes(info.planner.planLocalMemoryBytes);
+  tiling.set_maxQueries(info.maxQueries);
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 

@@ -1,4 +1,8 @@
-# 950PR 请求级共享 KV planner 优化
+# 请求级共享 planner 历史设计
+
+> 当前优化与验收仅针对融合 `QuantLightningIndexerSparseKv`。本文记录独立原型阶段，
+> 其中构建命令和独立 kernel 边界不再代表当前方案。请使用
+> [融合构建与测试说明](../README.request-shared-950.md)。
 
 日期：2026-10-28。基线：`wzj_kv_offload_opt@fcf6cd850`。
 开发分支：`perf/950pr-request-shared-planner`。

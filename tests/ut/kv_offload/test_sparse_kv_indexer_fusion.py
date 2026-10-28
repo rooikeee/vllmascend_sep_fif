@@ -42,92 +42,30 @@ def _make_plan_context(planner: SparseKVSimtLru) -> SparseKVIndexerPlanContext:
     )
 
 
-def test_simt_fused_plan_uses_full_persistent_workspace_and_original_state():
+def test_legacy_row_pool_rejects_request_major_fused_abi():
     planner = SparseKVSimtLru.__new__(SparseKVSimtLru)
-    planner.max_rows = 32
-    planner.topk = 4
-    planner.capacity = 8
-    planner.max_token = 64
-    planner.block_size = 16
-    planner.host_num_blocks = 32
-    planner.current_slots = torch.arange(256, dtype=torch.int32).reshape(32, 8)
-    planner.active_rows = _tensor(17)
-    planner.compact_workspace = torch.empty(
-        (planner.max_rows, sparse_kv_plan_workspace_elements(planner.topk, planner.capacity)), dtype=torch.int32
-    )
-    state = SimpleNamespace(
-        last_req_ids=torch.full((32,), -1, dtype=torch.int64),
-        slot_to_token=torch.full((32, 8), -1, dtype=torch.int32),
-        lru_slots=torch.arange(8, dtype=torch.int32).repeat(32, 1),
-        miss_count=torch.zeros(32, dtype=torch.int32),
-        miss_tokens=torch.full((32, 4), -1, dtype=torch.int32),
-        miss_slots=torch.full((32, 4), -1, dtype=torch.int32),
-    )
-    planner.layers = [state]
-    planner.plan_owner_layer_id = None
-    expected_indices = torch.arange(128, dtype=torch.int32).reshape(32, 1, 4)
-    planner._fused_indexer_op = MagicMock(return_value=expected_indices)
+    planner._fused_indexer_op = MagicMock()
     context = _make_plan_context(planner)
-    query = torch.zeros((32, 32, 128))
-    key = torch.zeros((2, 16, 1, 128))
-    weights = torch.zeros((32, 32))
-    query_scale = torch.ones((32, 32))
-    key_scale = torch.ones((2, 16))
-    query_lens = torch.arange(1, 33, dtype=torch.int32)
-    key_lens = torch.arange(11, 43, dtype=torch.int32)
-    indexer_table = torch.arange(64, dtype=torch.int32).reshape(32, 2)
-
-    result = context.select_and_plan(
-        query=query,
-        key=key,
-        weights=weights,
-        query_dequant_scale=query_scale,
-        key_dequant_scale=key_scale,
-        actual_seq_lengths_query=query_lens,
-        actual_seq_lengths_key=key_lens,
-        indexer_block_table=indexer_table,
-    )
-
-    assert result.shape == (32, 1, 4)
-    torch.testing.assert_close(result, expected_indices)
-    assert context.prepared is True
-    assert planner.compact_workspace.numel() == 32 * sparse_kv_plan_workspace_elements(4, 8)
-    planner._fused_indexer_op.assert_called_once_with(
-        query,
-        key,
-        weights,
-        query_scale,
-        key_scale,
-        query_lens,
-        key_lens,
-        indexer_table,
-        context.req_ids,
-        context.stable_prefix_lens,
-        context.visible_seq_lens,
-        context.token_to_req,
-        context.kv_block_table,
-        planner.active_rows,
-        state.last_req_ids,
-        state.slot_to_token,
-        state.lru_slots,
-        planner.current_slots,
-        state.miss_count,
-        state.miss_tokens,
-        state.miss_slots,
-        planner.compact_workspace,
-        planner.capacity,
-        planner.max_token,
-        planner.block_size,
-        planner.host_num_blocks,
-    )
-    assert planner.plan_owner_layer_id == 0
+    with pytest.raises(RuntimeError, match="request-major"):
+        context.select_and_plan(
+            query=torch.zeros((32, 32, 128)),
+            key=torch.zeros((2, 128, 1, 128)),
+            weights=torch.zeros((32, 32)),
+            query_dequant_scale=torch.ones((32, 32)),
+            key_dequant_scale=torch.ones((2, 128)),
+            actual_seq_lengths_query=torch.arange(1, 33, dtype=torch.int32),
+            actual_seq_lengths_key=torch.arange(11, 43, dtype=torch.int32),
+            indexer_block_table=torch.zeros((32, 2), dtype=torch.int32),
+        )
+    assert not context.prepared
+    planner._fused_indexer_op.assert_not_called()
 
 
 @pytest.mark.parametrize(
     ("capacity", "expected_shape"),
     [
         (8, (1, 1)),
-        (16384, (3, sparse_kv_plan_workspace_elements(4, 16384))),
+        (32768, (3, sparse_kv_plan_workspace_elements(4, 32768))),
     ],
 )
 def test_simt_constructor_allocates_workspace_only_when_plan_exceeds_ub(
@@ -383,6 +321,16 @@ def test_offload_hook_sets_active_rows_before_exposing_context_and_clears_on_fal
     metadata.sparse_kv_plan_context = context
     indexer_metadata.sparse_kv_plan_context = context
     impl._prepare_indexer_runtime_context(indexer_metadata, metadata, parallel)
+    assert metadata.sparse_kv_plan_context is None
+    assert indexer_metadata.sparse_kv_plan_context is None
+    manager.prepare_fused_indexer_plan.assert_called_once()
+
+    indexer_metadata.block_size = 128
+    manager.simt_lru.supports_fused_indexer = False
+    metadata.sparse_kv_plan_context = context
+    indexer_metadata.sparse_kv_plan_context = context
+    with patch("vllm_ascend.attention.sfa_kv_offload.get_sparse_kv_offload_manager", return_value=manager):
+        impl._prepare_indexer_runtime_context(indexer_metadata, metadata, parallel)
     assert metadata.sparse_kv_plan_context is None
     assert indexer_metadata.sparse_kv_plan_context is None
     manager.prepare_fused_indexer_plan.assert_called_once()

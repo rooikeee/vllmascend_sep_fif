@@ -28,6 +28,7 @@ namespace QLIKernel {
 using namespace QLICommon;
 constexpr uint32_t TRUNK_LEN_16K = 16384;
 constexpr uint32_t TRUNK_LEN_6K = 6144;
+constexpr uint32_t QLI_TOPK_SLAB_BYTES = 89344;
 template <typename QLIT>
 class QLIVector {
 public:
@@ -50,7 +51,7 @@ public:
     __aicore__ inline void InitVecInputTensor(GlobalTensor<W_T> weightsGm, GlobalTensor<SCALE_T> qScaleGm,
                                               GlobalTensor<SCALE_T> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
-    __aicore__ inline void InitSparseKvPlan(const SparseKvPlanRuntimeContext& context);
+    __aicore__ inline void PlanRequests(const request_plan::Context& context, const request_plan::Shape& shape);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void ProcessInvalidRow(int64_t row);
     __aicore__ inline void AllocEventID();
@@ -82,7 +83,6 @@ protected:
     static constexpr uint32_t V_MTE2_EVENT3 = EVENT_ID5;
 
 private:
-    __aicore__ inline void ProcessSparseKvPlanRow(int64_t row, LocalTensor<int32_t> topkIndices);
     __aicore__ inline void GetKeyScale(const QLICommon::RunInfo& runInfo, LocalTensor<SCALE_T>& kScaleUB,
                                        int64_t batchId, int64_t startS2, int64_t getLen);
     // ================================Local Buffer区====================================
@@ -121,11 +121,6 @@ private:
 
     LocalTensor<int32_t> outInvalidLocal_;
 
-    TBuf<TPosition::VECCALC> plannerScanBuf_;
-    LocalTensor<int32_t> plannerScanLocal_;
-    SparseKvPlanRuntimeContext plannerContext_{};
-    uint32_t plannerRowUbBytes_ = 0U;
-
     int32_t blockId_ = -1;
     // para for vector
     int32_t groupInner_ = 0;
@@ -163,14 +158,12 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe* pipe)
     pipe->InitBuffer(outBuf_, 2 * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ * sizeof(SCORE_T));
     vec1OutUB_ = outBuf_.Get<SCORE_T>();
 
-    // Only final-row TopK temporaries share this slab; indices and live AIC/MTE buffers stay separate.
+    // The request planner reuses this slab only after every TopK has completed.
     const uint32_t mrgValueBytes = (topkCountAlign256_ + trunkLen_) * sizeof(SCORE_T);
     const uint32_t scoreOutBytes = topkCountAlign256_ * sizeof(SCORE_T);
     const uint32_t topkSharedTmpSize = topkOp_.GetSharedTmpBufferSize();
     const uint32_t topkSlabBytes = mrgValueBytes + scoreOutBytes + topkSharedTmpSize;
-    // These TopK temporaries are dead after final indices and PIPE_V; the separate indices buffer stays live.
-    const uint32_t plannerScratchBytes = topkSlabBytes > plannerRowUbBytes_ ? topkSlabBytes : plannerRowUbBytes_;
-    pipe->InitBuffer(mrgValueBuf_, plannerScratchBytes);
+    pipe->InitBuffer(mrgValueBuf_, topkSlabBytes);
     mrgValueLocal_ = mrgValueBuf_.Get<SCORE_T>();
 
     pipe->InitBuffer(indicesOutBuf_,
@@ -184,54 +177,30 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe* pipe)
         mrgValueBuf_.GetWithOffset<uint32_t>(topkSharedTmpSize / sizeof(uint32_t), mrgValueBytes + scoreOutBytes);
     topkOp_.InitBuffers(topkSharedTmpLocal_, indicesOutLocal_);
 
-    pipe->InitBuffer(plannerScanBuf_, sparse_kv_plan_cfg::PLAN_SCAN_BYTES);
-    plannerScanLocal_ = plannerScanBuf_.Get<int32_t>();
-
     // 刷-1
     Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * 16);
 }
 
 template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::InitSparseKvPlan(const SparseKvPlanRuntimeContext& context)
+__aicore__ inline void QLIVector<QLIT>::PlanRequests(
+    const request_plan::Context& c, const request_plan::Shape& s)
 {
-    plannerContext_ = context;
-}
-
-template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::ProcessSparseKvPlanRow(int64_t row, LocalTensor<int32_t> topkIndices)
-{
-    if (row < 0 || row >= plannerContext_.numRows) {
+    // All AIVs (including idle and empty-input cores) enter the hardware barrier.
+    // MTE3 TopK stores complete before SIMT reads another producer's GM output.
+    SyncAll();
+    if (GetBlockIdx() >= static_cast<uint32_t>(s.requests)) {
         return;
     }
-    // Finish the final merge before SIMT reuses its scratch, and finish SIMT before the next TopK row.
-    PipeBarrier<PIPE_V>();
-    if (plannerRowUbBytes_ != 0U) {
-        asc_vf_call<SparseKvPlanRuntimeRowVf<__ubuf__ int32_t*, __ubuf__ int32_t*>>(
-            dim3(PLAN_THREADS), reinterpret_cast<__ubuf__ int32_t*>(plannerScanLocal_.GetPhyAddr()), row,
-            plannerContext_.reqIds, plannerContext_.lastReqIds,
-            reinterpret_cast<__ubuf__ int32_t*>(topkIndices.GetPhyAddr()), plannerContext_.stablePrefixLens,
-            plannerContext_.visibleSeqLens, plannerContext_.tokenToReq, plannerContext_.blockTable,
-            plannerContext_.slotToToken, plannerContext_.lruSlots, plannerContext_.currentSlots,
-            plannerContext_.missCount, plannerContext_.missTokens, plannerContext_.missSlots,
-            reinterpret_cast<__ubuf__ int32_t*>(mrgValueLocal_.GetPhyAddr()), plannerContext_.hashCapacity,
-            plannerContext_.topk, plannerContext_.capacity,
-            plannerContext_.maxToken, plannerContext_.maxRequests, plannerContext_.maxNumBlocks,
-            plannerContext_.hostNumBlocks, plannerContext_.blockSize);
-    } else {
-        __gm__ int32_t* rowWorkspace =
-            plannerContext_.compactWorkspace + static_cast<uint64_t>(row) * plannerContext_.workspaceRowElements;
-        asc_vf_call<SparseKvPlanRuntimeRowVf<__ubuf__ int32_t*, __gm__ int32_t*>>(
-            dim3(PLAN_THREADS), reinterpret_cast<__ubuf__ int32_t*>(plannerScanLocal_.GetPhyAddr()), row,
-            plannerContext_.reqIds, plannerContext_.lastReqIds,
-            reinterpret_cast<__ubuf__ int32_t*>(topkIndices.GetPhyAddr()), plannerContext_.stablePrefixLens,
-            plannerContext_.visibleSeqLens, plannerContext_.tokenToReq, plannerContext_.blockTable,
-            plannerContext_.slotToToken, plannerContext_.lruSlots, plannerContext_.currentSlots,
-            plannerContext_.missCount, plannerContext_.missTokens, plannerContext_.missSlots, rowWorkspace,
-            plannerContext_.hashCapacity, plannerContext_.topk,
-            plannerContext_.capacity, plannerContext_.maxToken, plannerContext_.maxRequests,
-            plannerContext_.maxNumBlocks, plannerContext_.hostNumBlocks, plannerContext_.blockSize);
-    }
-    PipeBarrier<PIPE_V>();
+    static_assert(sizeof(request_plan::Control) <= QLI_TOPK_SLAB_BYTES);
+    asc_vf_call<RunRequestPlan>(dim3(request_plan::THREADS),
+        reinterpret_cast<__ubuf__ request_plan::Control*>(mrgValueLocal_.GetPhyAddr()),
+        c.reqIds, c.topk, c.stable, c.visible, c.rowToReq, c.table, c.active,
+        c.lastIds, c.tokens, c.priority, c.freeMask, c.freeStack, c.freeCount,
+        c.clock, c.slots, c.missCount, c.missTokens, c.missSlots, c.tokenToSlot,
+        c.status, c.residentEnd, s.requests, s.rows, s.topk, s.capacity, s.maxToken,
+        s.pages, s.hostBlocks, s.blockSize, s.maxQueries,
+        static_cast<int32_t>(GetBlockIdx()), static_cast<int32_t>(GetBlockNum() * 2));
+    PipeBarrier<PIPE_ALL>();
 }
 
 template <typename QLIT>
@@ -259,11 +228,6 @@ __aicore__ inline void QLIVector<QLIT>::InitParams(const struct QLICommon::Const
     topkCount_ = constInfo.sparseCount;
     topkOp_.Init(topkCount_, trunkLen_);
     topkCountAlign256_ = QLICommon::Align(constInfo.sparseCount, (uint64_t)256); // topkCount对齐到256
-    const uint64_t rowBytes = tilingData->workspaceRowElements * sizeof(int32_t);
-    const uint64_t alignedRowBytes = (rowBytes + 31U) & ~static_cast<uint64_t>(31U);
-    plannerRowUbBytes_ = alignedRowBytes <= sparse_kv_plan_cfg::PLAN_ROW_UB_LIMIT_BYTES
-                             ? static_cast<uint32_t>(alignedRowBytes)
-                             : 0U;
 }
 
 template <typename QLIT>
@@ -321,7 +285,6 @@ __aicore__ inline void QLIVector<QLIT>::CleanInvalidOutput(int64_t invalidS1Offs
     PipeBarrier<PIPE_ALL>();
     Duplicate(outInvalidLocal_, constInfo_.INVALID_IDX, constInfo_.sparseCount);
     PipeBarrier<PIPE_ALL>();
-    ProcessSparseKvPlanRow(invalidS1Offset / constInfo_.sparseCount, outInvalidLocal_);
 
     AscendC::DataCopyParams dataCopyOutParams;
     dataCopyOutParams.blockCount = 1;
@@ -537,8 +500,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo& in
         if (qliValidS2Len <= 0) {
             WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>(), qliNeg, topkCount_);
-            ProcessSparseKvPlanRow(info.indiceOutOffset / topkCount_ + qliCurS1Idx + qliRowIdx,
-                                   indicesOutLocal_.ReinterpretCast<int32_t>());
             SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
             WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
             AscendC::DataCopyPad(indiceOutGm[info.indiceOutOffset + (qliCurS1Idx + qliRowIdx) * topkCount_],
@@ -640,9 +601,6 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo& in
             Duplicate(indicesOutLocal_.ReinterpretCast<int32_t>()[qliValidS2Len / 8 * 8 + 64], qliNeg,
                       topkCount_ - (qliValidS2Len / 8 * 8 + 64));
         }
-
-        ProcessSparseKvPlanRow(info.indiceOutOffset / topkCount_ + qliCurS1Idx + qliRowIdx,
-                               indicesOutLocal_.ReinterpretCast<int32_t>());
 
         SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);

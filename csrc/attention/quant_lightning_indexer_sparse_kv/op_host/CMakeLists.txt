@@ -9,24 +9,10 @@
 # -----------------------------------------------------------------------------------------------------------
 add_op_to_compiled_list()
 
-set(
-    quant_lightning_indexer_sparse_kv_depends
-    "attention/sparse_kv_plan"
-    CACHE INTERNAL
-    "Kernel source dependencies for quant_lightning_indexer_sparse_kv"
-)
-
 install(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/
     DESTINATION ${IMPL_INSTALL_DIR}/ascendc/quant_lightning_indexer_sparse_kv/vendor
 )
-install(
-    FILES
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../sparse_kv_plan/op_kernel/sparse_kv_plan_shared.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../sparse_kv_plan/op_kernel/sparse_kv_plan_config.h
-    DESTINATION ${IMPL_INSTALL_DIR}/ascendc/quant_lightning_indexer_sparse_kv/planner
-)
-
 if(BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnn PRIVATE
         quant_lightning_indexer_sparse_kv_def.cpp

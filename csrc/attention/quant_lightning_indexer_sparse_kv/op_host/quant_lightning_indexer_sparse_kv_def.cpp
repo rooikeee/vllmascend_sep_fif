@@ -72,12 +72,18 @@ public:
         AddInt32Input(*this, "active_rows");
         AddMutableInt64Input(*this, "last_req_ids");
         AddMutableInt32Input(*this, "slot_to_token");
-        AddMutableInt32Input(*this, "lru_slots");
+        AddMutableInt64Input(*this, "priority");
+        AddMutableInt32Input(*this, "free_mask");
+        AddMutableInt32Input(*this, "free_stack");
+        AddMutableInt32Input(*this, "free_count");
+        AddMutableInt64Input(*this, "clock");
         AddMutableInt32Input(*this, "current_slots");
         AddMutableInt32Input(*this, "miss_count");
         AddMutableInt32Input(*this, "miss_tokens");
         AddMutableInt32Input(*this, "miss_slots");
-        AddMutableInt32Input(*this, "compact_workspace");
+        AddMutableInt32Input(*this, "token_to_slot");
+        AddMutableInt32Input(*this, "status");
+        AddMutableInt32Input(*this, "resident_end");
 
         this->Output("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND});
@@ -95,6 +101,8 @@ public:
         this->Attr("max_token").AttrType(REQUIRED).Int();
         this->Attr("block_size").AttrType(REQUIRED).Int();
         this->Attr("host_num_blocks").AttrType(REQUIRED).Int();
+
+        this->Attr("max_queries").AttrType(REQUIRED).Int();
 
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)

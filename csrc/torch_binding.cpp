@@ -3001,10 +3001,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor actual_seq_lengths_key, Tensor indexer_block_table, Tensor req_ids, "
         "Tensor stable_prefix_lens, Tensor visible_seq_lens, Tensor token_to_req, "
         "Tensor kv_block_table, Tensor active_rows, Tensor(a!) last_req_ids, "
-        "Tensor(b!) slot_to_token, Tensor(c!) lru_slots, Tensor(d!) current_slots, "
-        "Tensor(e!) miss_count, Tensor(f!) miss_tokens, Tensor(g!) miss_slots, "
-        "Tensor(h!) compact_workspace, int capacity, int max_token, int block_size, "
-        "int host_num_blocks) -> Tensor");
+        "Tensor(b!) slot_to_token, Tensor(c!) priority, Tensor(d!) free_mask, Tensor(e!) free_stack, "
+        "Tensor(f!) free_count, Tensor(g!) clock, Tensor(h!) current_slots, Tensor(i!) miss_count, "
+        "Tensor(j!) miss_tokens, Tensor(k!) miss_slots, Tensor(l!) token_to_slot, Tensor(m!) status, "
+        "Tensor(n!) resident_end, int capacity, int max_token, int block_size, "
+        "int host_num_blocks, int max_queries) -> Tensor");
     ops.impl("npu_quant_lightning_indexer_sparse_kv", torch::kPrivateUse1,
              &vllm_ascend::npu_quant_lightning_indexer_sparse_kv);
 

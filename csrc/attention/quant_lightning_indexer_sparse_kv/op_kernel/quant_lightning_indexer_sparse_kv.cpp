@@ -6,11 +6,7 @@
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
 #include "quant_lightning_indexer_sparse_kv_template_tiling_key.h"
-#if __has_include("../../sparse_kv_plan/op_kernel/sparse_kv_plan_shared.h")
-#include "../../sparse_kv_plan/op_kernel/sparse_kv_plan_shared.h"
-#else
-#include "planner/sparse_kv_plan_shared.h"
-#endif
+#include "request_plan_vf.h"
 #if __has_include("../vendor/quant_lightning_indexer/op_kernel/arch35/quant_lightning_indexer_kernel_arch35.h")
 #include "../vendor/quant_lightning_indexer/op_kernel/arch35/quant_lightning_indexer_kernel_arch35.h"
 #else
@@ -25,8 +21,9 @@ __global__ __aicore__ void quant_lightning_indexer_sparse_kv(
     GM_ADDR actualSeqLengthsQ, GM_ADDR actualSeqLengthsK, GM_ADDR indexerBlockTable,
     GM_ADDR reqIds, GM_ADDR stablePrefixLens, GM_ADDR visibleSeqLens, GM_ADDR tokenToReq,
     GM_ADDR kvBlockTable, GM_ADDR activeRows, GM_ADDR lastReqIds, GM_ADDR slotToToken,
-    GM_ADDR lruSlots, GM_ADDR currentSlots, GM_ADDR missCount, GM_ADDR missTokens,
-    GM_ADDR missSlots, GM_ADDR compactWorkspace, GM_ADDR sparseIndices, GM_ADDR workspace,
+    GM_ADDR priority, GM_ADDR freeMask, GM_ADDR freeStack, GM_ADDR freeCount, GM_ADDR clock,
+    GM_ADDR currentSlots, GM_ADDR missCount, GM_ADDR missTokens, GM_ADDR missSlots,
+    GM_ADDR tokenToSlot, GM_ADDR status, GM_ADDR residentEnd, GM_ADDR sparseIndices, GM_ADDR workspace,
     GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -44,24 +41,25 @@ __global__ __aicore__ void quant_lightning_indexer_sparse_kv(
     qli.Init(query, key, weights, queryScale, keyScale, actualSeqLengthsQ,
              actualSeqLengthsK, indexerBlockTable, sparseIndices, userWorkspace,
              tilingData, &pipe);
-    if ASCEND_IS_AIV {
-        const int32_t requestedRows = *reinterpret_cast<__gm__ int32_t*>(activeRows);
-        const int64_t numRows =
-            requestedRows > 0 && requestedRows < tilingData->maxRows
-                ? requestedRows
-                : (requestedRows > 0 ? tilingData->maxRows : 0);
-        SparseKvPlanRuntimeContext plannerContext{
-            reinterpret_cast<__gm__ int64_t*>(reqIds), reinterpret_cast<__gm__ int64_t*>(lastReqIds),
-            reinterpret_cast<__gm__ int32_t*>(stablePrefixLens),
-            reinterpret_cast<__gm__ int32_t*>(visibleSeqLens), reinterpret_cast<__gm__ int32_t*>(tokenToReq),
-            reinterpret_cast<__gm__ int32_t*>(kvBlockTable), reinterpret_cast<__gm__ int32_t*>(slotToToken),
-            reinterpret_cast<__gm__ int32_t*>(lruSlots), reinterpret_cast<__gm__ int32_t*>(currentSlots),
-            reinterpret_cast<__gm__ int32_t*>(missCount), reinterpret_cast<__gm__ int32_t*>(missTokens),
-            reinterpret_cast<__gm__ int32_t*>(missSlots), reinterpret_cast<__gm__ int32_t*>(compactWorkspace),
-            numRows, tilingData->hashCapacity, tilingData->workspaceRowElements, tilingData->topk,
-            tilingData->capacity, tilingData->maxToken, tilingData->maxRequests, tilingData->maxNumBlocks,
-            tilingData->hostNumBlocks, tilingData->planBlockSize};
-        qli.InitSparseKvPlan(plannerContext);
-    }
     qli.Process();
+    if ASCEND_IS_AIV {
+        request_plan::Context context{
+            reinterpret_cast<__gm__ int64_t*>(reqIds), reinterpret_cast<__gm__ int32_t*>(sparseIndices),
+            reinterpret_cast<__gm__ int32_t*>(stablePrefixLens), reinterpret_cast<__gm__ int32_t*>(visibleSeqLens),
+            reinterpret_cast<__gm__ int32_t*>(tokenToReq), reinterpret_cast<__gm__ int32_t*>(kvBlockTable),
+            reinterpret_cast<__gm__ int32_t*>(activeRows), reinterpret_cast<__gm__ int64_t*>(lastReqIds),
+            reinterpret_cast<__gm__ int32_t*>(slotToToken), reinterpret_cast<__gm__ int64_t*>(priority),
+            reinterpret_cast<__gm__ int32_t*>(freeMask), reinterpret_cast<__gm__ int32_t*>(freeStack),
+            reinterpret_cast<__gm__ int32_t*>(freeCount), reinterpret_cast<__gm__ int64_t*>(clock),
+            reinterpret_cast<__gm__ int32_t*>(currentSlots), reinterpret_cast<__gm__ int32_t*>(missCount),
+            reinterpret_cast<__gm__ int32_t*>(missTokens), reinterpret_cast<__gm__ int32_t*>(missSlots),
+            reinterpret_cast<__gm__ int32_t*>(tokenToSlot), reinterpret_cast<__gm__ int32_t*>(status),
+            reinterpret_cast<__gm__ int32_t*>(residentEnd)};
+        request_plan::Shape shape{
+            static_cast<int32_t>(tilingData->maxRequests), static_cast<int32_t>(tilingData->maxRows),
+            static_cast<int32_t>(tilingData->topk), static_cast<int32_t>(tilingData->capacity),
+            static_cast<int32_t>(tilingData->maxToken), static_cast<int32_t>(tilingData->maxNumBlocks),
+            static_cast<int32_t>(tilingData->hostNumBlocks), tilingData->planBlockSize, tilingData->maxQueries};
+        qli.PlanRequests(context, shape);
+    }
 }

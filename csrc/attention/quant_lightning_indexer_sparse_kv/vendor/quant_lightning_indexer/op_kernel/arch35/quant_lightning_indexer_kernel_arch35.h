@@ -61,7 +61,7 @@ public:
                                 __gm__ uint8_t* actualSeqLengthsK, __gm__ uint8_t* blockTable,
                                 __gm__ uint8_t* sparseIndices, __gm__ uint8_t* workspace,
                                 const QuantLightningIndexerSparseKvTilingData* __restrict tiling, TPipe* tPipe);
-    __aicore__ inline void InitSparseKvPlan(const SparseKvPlanRuntimeContext& context);
+    __aicore__ inline void PlanRequests(const request_plan::Context& context, const request_plan::Shape& shape);
     __aicore__ inline void Process();
 
     // =================================类型定义区=================================
@@ -360,11 +360,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::DealActSeqLenIsZero(ui
 }
 
 template <typename QLIT>
-__aicore__ inline void QuantLightningIndexerKernel<QLIT>::InitSparseKvPlan(
-    const SparseKvPlanRuntimeContext& context)
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::PlanRequests(
+    const request_plan::Context& context, const request_plan::Shape& shape)
 {
     if ASCEND_IS_AIV {
-        vectorService.InitSparseKvPlan(context);
+        vectorService.PlanRequests(context, shape);
     }
 }
 

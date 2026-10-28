@@ -1,4 +1,6 @@
-> 950PR request-shared miss planner: see [build and test instructions](README.request-shared-950.md).
+> **950PR 优化范围：只优化融合算子 `QuantLightningIndexerSparseKv`，测试和性能验收也只针对融合算子。**
+> 反向表、free 栈、MTP 请求共享均在同一次融合 kernel 内执行；不再开发或验收独立 planner。
+> 构建与测试见 [融合算子说明](README.request-shared-950.md)。
 
 <p align="center">
   <picture>

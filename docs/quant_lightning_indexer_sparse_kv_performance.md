@@ -1,5 +1,9 @@
 # QuantLightningIndexerSparseKv performance measurement
 
+> 本文记录旧逐行 ABI 的测试/性能方案。当前仅优化和验收请求共享融合算子，
+> 请使用 [融合算子构建与测试](../README.request-shared-950.md)；旧三路径 benchmark
+> 和独立 planner 测试不能作为新 ABI 的验收结果。
+
 Measure the fused operator against stock
 `torch_npu.npu_quant_lightning_indexer` plus
 `torch.ops._C_ascend.npu_sparse_kv_plan` on Ascend 950 with CANN 9.1.0. The

@@ -65,6 +65,7 @@ class SparseKVSimtLru:
     ) -> None:
         if max_rows <= 0 or topk <= 0 or topk > capacity:
             raise ValueError(f"Invalid sparse KV SIMT shape: rows={max_rows}, topk={topk}, capacity={capacity}")
+        self.supports_fused_indexer = False  # The new fused ABI owns request-major pools.
         self.max_rows = max_rows
         self.topk = topk
         self.capacity = capacity
@@ -164,37 +165,11 @@ class SparseKVSimtLru:
         actual_seq_lengths_key: torch.Tensor,
         indexer_block_table: torch.Tensor,
     ) -> torch.Tensor:
-        state = self.layers[context.layer_id]
-        result = self._fused_indexer_op(
-            query,
-            key,
-            weights,
-            query_dequant_scale,
-            key_dequant_scale,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            indexer_block_table,
-            context.req_ids,
-            context.stable_prefix_lens,
-            context.visible_seq_lens,
-            context.token_to_req,
-            context.kv_block_table,
-            self.active_rows,
-            state.last_req_ids,
-            state.slot_to_token,
-            state.lru_slots,
-            self.current_slots,
-            state.miss_count,
-            state.miss_tokens,
-            state.miss_slots,
-            self.compact_workspace,
-            self.capacity,
-            self.max_token,
-            self.block_size,
-            self.host_num_blocks,
+        raise RuntimeError(
+            "The fused QLI ABI now requires request-major reverse-map/free-stack state. "
+            "SparseKVSimtLru owns legacy row-major pools and cannot dispatch this ABI; "
+            "use SparseKVFusedIndexer for operator validation. Serving pool migration is pending."
         )
-        self.plan_owner_layer_id = context.layer_id
-        return result
 
     def transfer_prepared_plan(
         self,

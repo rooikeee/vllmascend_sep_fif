@@ -14,65 +14,24 @@ ROOT = Path(__file__).resolve().parents[3]
 RUNNER = ROOT / "tools/run_quant_lightning_indexer_sparse_kv_tests.py"
 
 
-def test_benchmark_dry_run_covers_all_batches_lengths_and_mtp_without_npu(tmp_path: Path) -> None:
+def test_old_three_route_benchmark_is_not_an_acceptance_entry(tmp_path: Path) -> None:
     result = subprocess.run(
         [sys.executable, str(RUNNER), "--suite", "benchmark", "--dry-run", "--output", str(tmp_path)],
         cwd=ROOT,
         capture_output=True,
         text=True,
     )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    plan = json.loads((tmp_path / "plan.json").read_text())
-    assert plan["case_count"] == 32 * 3 * 4 * 2
-    assert {case["batch"] for case in plan["cases"]} == set(range(1, 33))
-    assert {case["seq_len"] for case in plan["cases"]} == {4096, 32768, 140000}
-    assert {case["mtp"] for case in plan["cases"]} == {1, 2, 4, 6}
-    assert {case["cache_state"] for case in plan["cases"]} == {"cold", "warm"}
+    assert result.returncode != 0
+    assert "invalid choice" in result.stderr
+    assert "torch_npu" not in result.stderr
     assert not (tmp_path / "results.csv").exists()
-    assert not (tmp_path / "environment.json").exists()
 
 
-def test_benchmark_dry_run_accepts_custom_graph_matrix(tmp_path: Path) -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(RUNNER),
-            "--suite",
-            "benchmark",
-            "--dry-run",
-            "--output",
-            str(tmp_path),
-            "--batches",
-            "1,17,32",
-            "--seq-lens",
-            "140000,143360",
-            "--mtps",
-            "1,6",
-            "--capacities",
-            "4096,8192,14336,14337,16384",
-            "--cache-states",
-            "cold",
-            "--execution",
-            "graph",
-            "--iterations",
-            "3",
-            "--rounds",
-            "2",
-            "--warmup",
-            "4",
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    plan = json.loads((tmp_path / "plan.json").read_text())
-    assert plan["case_count"] == 60
-    assert {case["capacity"] for case in plan["cases"]} == {4096, 8192, 14336, 14337, 16384}
-    assert plan["timing"] == {"warmup": 4, "iterations": 3, "rounds": 2, "seed": 2026}
-    assert all(case["execution"] == "graph" for case in plan["cases"])
+def test_help_only_offers_current_fused_suites() -> None:
+    result = subprocess.run([sys.executable, str(RUNNER), "--help"], cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0
+    assert "{static,device}" in result.stdout
+    assert "benchmark-static" not in result.stdout
 
 
 @pytest.mark.parametrize("options", [("--batches", "33"), ("--rounds", "0"), ("--mtps", "0")])
@@ -136,7 +95,7 @@ def test_benchmark_records_failure_without_a_successful_timing_row(
         assert not (tmp_path / "results.json").exists()
 
 
-def test_benchmark_refuses_to_overwrite_completed_results(tmp_path: Path) -> None:
+def test_retired_benchmark_command_preserves_existing_results(tmp_path: Path) -> None:
     previous = '{"results": []}\n'
     (tmp_path / "results.json").write_text(previous)
 
@@ -148,5 +107,5 @@ def test_benchmark_refuses_to_overwrite_completed_results(tmp_path: Path) -> Non
     )
 
     assert result.returncode != 0
-    assert "Results already exist" in result.stderr
+    assert "invalid choice" in result.stderr
     assert (tmp_path / "results.json").read_text() == previous

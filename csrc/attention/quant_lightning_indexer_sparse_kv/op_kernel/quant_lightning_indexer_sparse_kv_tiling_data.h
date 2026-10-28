@@ -23,8 +23,6 @@ struct alignas(8) QuantLightningIndexerSparseKvTilingData {
     uint32_t blockSize;
     uint32_t maxBlockNumPerBatch;
     uint32_t sparseMode;
-    uint64_t hashCapacity;
-    uint64_t workspaceRowElements;
     int64_t maxRows;
     int64_t topk;
     int64_t capacity;
@@ -33,11 +31,11 @@ struct alignas(8) QuantLightningIndexerSparseKvTilingData {
     int64_t maxNumBlocks;
     int64_t hostNumBlocks;
     int32_t planBlockSize;
-    uint32_t planLocalMemoryBytes;
+    int32_t maxQueries;
 };
 
-static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 136);
-static_assert(offsetof(QuantLightningIndexerSparseKvTilingData, hashCapacity) == 56);
-static_assert(offsetof(QuantLightningIndexerSparseKvTilingData, planBlockSize) == 128);
+static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 120);
+static_assert(offsetof(QuantLightningIndexerSparseKvTilingData, maxRows) == 56);
+static_assert(offsetof(QuantLightningIndexerSparseKvTilingData, planBlockSize) == 112);
 
 #endif

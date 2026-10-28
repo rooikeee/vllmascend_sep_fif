@@ -354,6 +354,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         manager = get_sparse_kv_offload_manager()
         if (
             not manager.uses_simt_lru
+            or not manager.simt_lru.supports_fused_indexer
             or manager.topk != _FUSED_INDEXER_TOPK
             or manager.block_size != _FUSED_INDEXER_BLOCK_SIZE
         ):

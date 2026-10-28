@@ -22,17 +22,15 @@ EXPECTED_FIELDS = (
     ("uint32_t", "blockSize", 40),
     ("uint32_t", "maxBlockNumPerBatch", 44),
     ("uint32_t", "sparseMode", 48),
-    ("uint64_t", "hashCapacity", 56),
-    ("uint64_t", "workspaceRowElements", 64),
-    ("int64_t", "maxRows", 72),
-    ("int64_t", "topk", 80),
-    ("int64_t", "capacity", 88),
-    ("int64_t", "maxToken", 96),
-    ("int64_t", "maxRequests", 104),
-    ("int64_t", "maxNumBlocks", 112),
-    ("int64_t", "hostNumBlocks", 120),
-    ("int32_t", "planBlockSize", 128),
-    ("uint32_t", "planLocalMemoryBytes", 132),
+    ("int64_t", "maxRows", 56),
+    ("int64_t", "topk", 64),
+    ("int64_t", "capacity", 72),
+    ("int64_t", "maxToken", 80),
+    ("int64_t", "maxRequests", 88),
+    ("int64_t", "maxNumBlocks", 96),
+    ("int64_t", "hostNumBlocks", 104),
+    ("int32_t", "planBlockSize", 112),
+    ("int32_t", "maxQueries", 116),
 )
 
 
@@ -116,16 +114,16 @@ struct alignas(8) HostFieldOrderMirror {{
 }};
 
 static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == sizeof(HostFieldOrderMirror));
-static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 136);
+static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 120);
 static_assert(alignof(QuantLightningIndexerSparseKvTilingData) == 8);
 {offset_checks}
 {type_checks}
 
 int main() {{
     QuantLightningIndexerSparseKvTilingData data{{}};
-    data.hashCapacity = 4096;
-    data.planLocalMemoryBytes = 544;
-    return data.hashCapacity == 4096 && data.planLocalMemoryBytes == 544 ? 0 : 1;
+    data.maxQueries = 4;
+    data.capacity = 8192;
+    return data.maxQueries == 4 && data.capacity == 8192 ? 0 : 1;
 }}
 """
     )
@@ -145,35 +143,8 @@ def test_fixed_contract_formulas_and_workspace_shapes_execute_real_host_code(tmp
 using namespace optiling::qli_sparse_kv_contract;
 
 int main() {{
-    const PlannerSizing small = ComputePlannerSizing(4096, 64);
-    const PlannerSizing large = ComputePlannerSizing(4096, 65);
-    if (small.hashCapacity != 4096 || small.workspaceRowElements != 18432 ||
-        small.planLocalMemoryBytes != 74016 || small.dynamicUbBytes != 150816) {{
-        return 1;
-    }}
-    if (large.dynamicUbBytes != 187168) {{
-        return 2;
-    }}
-    const PlannerSizing gm = ComputePlannerSizing(14337, 65);
-    if (gm.planLocalMemoryBytes != 288 || gm.dynamicUbBytes != 187168) {{
-        return 3;
-    }}
-    const PlannerSizing ubBoundary = ComputePlannerSizing(14336, 65);
-    if (ubBoundary.workspaceRowElements != 28672 || ubBoundary.planLocalMemoryBytes != 114976 ||
-        ubBoundary.dynamicUbBytes != 212512) {{
-        return 9;
-    }}
-    if (!CompactWorkspaceShapeIsValid(1, 1, small, 64) ||
-        !CompactWorkspaceShapeIsValid(64, 18432, small, 64) ||
-        CompactWorkspaceShapeIsValid(1, 2, small, 64) ||
-        CompactWorkspaceShapeIsValid(63, 18432, small, 64)) {{
-        return 4;
-    }}
-    if (!CompactWorkspaceShapeIsValid(65, gm.workspaceRowElements, gm, 65) ||
-        CompactWorkspaceShapeIsValid(65, gm.workspaceRowElements + 1, gm, 65) ||
-        CompactWorkspaceShapeIsValid(1, 1, gm, 65)) {{
-        return 5;
-    }}
+    if (DynamicUbBytes(64) != 150528 || DynamicUbBytes(65) != 186880 ||
+        MAX_QUERY_ROWS != 16 || TOPK != 2048) return 1;
     if (ResolveStride(0, 16384) != 0 || ResolveStride(-1, 16384) != 16384 ||
         ResolveStride(7, 16384) != 7) {{
         return 6;

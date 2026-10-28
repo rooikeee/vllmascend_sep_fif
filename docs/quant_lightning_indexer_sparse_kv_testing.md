@@ -1,5 +1,9 @@
 # QuantLightningIndexerSparseKv validation
 
+> 本文记录旧逐行 ABI 的测试/性能方案。当前仅优化和验收请求共享融合算子，
+> 请使用 [融合算子构建与测试](../README.request-shared-950.md)；旧三路径 benchmark
+> 和独立 planner 测试不能作为新 ABI 的验收结果。
+
 `torch.ops._C_ascend.npu_quant_lightning_indexer_sparse_kv` fuses the final
 quantized-lightning-indexer TopK row with SparseKvPlan state updates for the
 GLM-5.2 C8 decode and speculative-decode path. It keeps the logical TopK

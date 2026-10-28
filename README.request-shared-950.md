@@ -1,143 +1,116 @@
-# 950PR 请求级共享 miss planner
+# 950PR 融合 indexer 优化与验收
 
-分支：`perf/950pr-request-shared-planner`。基线：`wzj_kv_offload_opt@fcf6cd850`。
+**只优化融合算子 `QuantLightningIndexerSparseKv`，测试和性能验收也只针对融合算子。**
+不再以独立 `SparseKvPlan` / `SparseKvRequestPlan` 作为优化或验收入口。
+`SparseKvTransfer` 仅作为已有 KV 搬运组件，在融合输出的链路检查中复用。
 
-发布位置：`rooikeee/vllmascend_sep_fif` fork；上游为`AmourSec/vllmascend_sep_fif`。
+## 当前实现
 
-```bash
-git clone --single-branch --branch perf/950pr-request-shared-planner \
-  https://github.com/rooikeee/vllmascend_sep_fif.git vllmascend-request-shared
-cd vllmascend-request-shared
+一次 mixed AIC/AIV kernel 内执行：
+
+```text
+QLI score → 每行 TopK 写出 → 全 AIV SyncAll → 请求级共享 planner
 ```
 
-这版新增实验算子 `SparseKvRequestPlan`，供950PR上编译、正确性检查和后续性能测量。
-MTP3四行共享请求级持久`token_to_slot[B,L]`反向表，直接查hit/miss，用CAS去重，
-同一个token只搬一次。已经删除临时hash及为匹配命中执行的全缓存扫描，
-用free表/栈和时间戳优先级替换完整LRU顺序维护。
+planner 读取该次 QLI 产生的 TopK，一个 AIV 独占一个请求。MTP3 的四行共用：
 
-**反向表版更改了算子ABI，拉取更新后必须同时重编设备包和Torch桥接。**
-此前临时hash版的二进制不能与新代码混用。
+- 持久 `token_to_slot[B,L]` 反向表，直接查询命中，CAS 去重 miss。
+- `slot_to_token[B,C]`、free 标记和 free 栈；空位够用时直接分配。
+- int64 时间戳优先级；保护所有行选中项，只在空位不足时选择淘汰项。
+- 请求身份、rollback 后缀失效及错误状态；每轮清理 padding 输出。
 
-**目前是 TopK 后的独立 planner，不是已替换 serving 的融合 QLI。** 原服务仍走旧
-路径，直接启动原服务不会测到这版。第一版先验证请求级状态、分配和真实KV回搬；
-QLI融合、IndexCache跨层接线、服务集成和预取尚未完成。
+删除融合路径的逐行临时 hash、完整 LRU 重排和 planner GM scratch。
+planner 控制区复用已经结束使用的 TopK UB slab，动态 UB 为小 T 150528 字节、
+大 T 186880 字节。全 AIV（包括空闲核和空输入核）都参加同步；不在逐行回调内
+等待其他核。TopK 此版本经 GM 交接，不再声称 planner 直接读取每行 UB TopK。
+全局同步的实际代价和 GM 可见性需要 950 真机验证。
 
-## 环境
+## 接口与生命周期
 
-- Ascend950PR / CANN9.1，使用目标机原有匹配的Torch、torch-npu环境。
-- Python3.11+、C++20编译器（CPU测试）、C++17工具链（Torch桥接）、cmake、ninja、patch。
-- CPU测试需pytest；设备测试需torch和torch-npu。不需要先安装整个vLLM插件。
-- 所有命令从本仓库根目录执行，构建之前先source目标机CANN的`set_env.sh`并激活Python环境。
-- 本仓库`--soc=ascend950`构建脚本当前生成`Ascend950PR_9599`二进制；原profile写的是
-  `9589`，请核对目标机型号与CANN兼容性，不把交叉编译成功当成目标卡运行成功。
+**融合算子的 ACLNN/Torch ABI 已更新，设备包和 Torch 桥接必须一起重编。**
+输入保留 QLI 张量、请求元数据，替换旧 `lru_slots` / `compact_workspace` 为
+`priority`、`free_mask`、`free_stack`、`free_count`、`clock`、`token_to_slot`、
+`status`、`resident_end`，并新增 `max_queries` 属性。
 
-## 1. 编译两个设备算子
+状态按请求存储，输出槽位按 query 行存储；miss 清单为 `[B,max_queries*2048]`。
+MTP3 设置 `max_queries=4`，要求共享容量 `C >= max_queries*2048` 且按 128 对齐。
+反向表在创建时初始化为 -1，其他状态由
+`vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_fused_indexer.py`
+中的 `SparseKVFusedIndexer` 分配。capture 前分配状态，replay 只更新内容。
 
-同时编译planner和回搬算子，避免只安装planner后找不到transfer。
+调用次序为融合算子 → 原有 transfer → attention，同 stream 执行。
+`current_slots` 是相对请求池的槽号，物理地址必须按 `request*C+slot` 计算。
+`status != 0` 时不得消费当前计划。`check_status()` 仅用于 capture/计时外检查。
 
-如果是在旧版本checkout上更新，先移走旧`csrc/build`再构建。本仓库增量构建可能
-保留旧op-info/ACLNN接口和设备`.o`，日志显示成功也不代表接口已经更新。例如：
+本次交付范围是融合算子及其验收入口。原 serving 使用按行热池，其请求池布局、
+IndexCache 跨层状态与失败传播尚未迁移；不能把新 ABI 直接接到旧按行调用上。旧 manager 暂不启用此融合路径，继续使用
+原按行服务路径；直接调用其旧融合接口会明确报错，避免布局混用。
+
+## 编译
+
+目标：Ascend 950PR、CANN 9.1、匹配的 Torch/torch-npu。先 source CANN 的
+`set_env.sh` 并激活 Python 环境。工具链支持目标时，910 主机可以交叉编译 950
+二进制；**910 不能执行此算子，交叉编译成功不等于 950 验证通过。**
+
+从旧 checkout 更新时，先将 `csrc/build` 移到一个不存在的备份目录，避免复用旧 ABI。
+从仓库根目录执行：
 
 ```bash
-mkdir -p build
-# 仅在csrc/build存在、备份目标不存在时执行：
-mv csrc/build build/csrc-before-direct-map
-```
-
-```bash
+mkdir -p build/fused-logs
 set -o pipefail
-mkdir -p build/request-plan-logs
 (
   cd csrc
-  bash build.sh --pkg --ops=sparse_kv_request_plan,sparse_kv_transfer --soc=ascend950 -j4
-) 2>&1 | tee build/request-plan-logs/device-build.log
-```
+  CMAKE_BUILD_PARALLEL_LEVEL=4 bash build.sh --pkg \
+    --ops=quant_lightning_indexer_sparse_kv,sparse_kv_transfer --soc=ascend950 -j4
+) 2>&1 | tee build/fused-logs/device-build.log
 
-成功后生成 `csrc/build/cann-ops-transformer-custom_linux-aarch64.run`。
-安装到独立目录；不要覆盖正在使用的正式算子包：
-
-```bash
 bash csrc/build/cann-ops-transformer-custom_linux-aarch64.run \
-  --quiet --install-path="$PWD/build/request-plan-opp"
+  --quiet --install-path="$PWD/build/fused-indexer-opp"
+export FUSED_INDEXER_VENDOR="$PWD/build/fused-indexer-opp/vendors/custom_transformer"
+export ASCEND_CUSTOM_OPP_PATH="$FUSED_INDEXER_VENDOR${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+export LD_LIBRARY_PATH="$FUSED_INDEXER_VENDOR/op_api/lib:$FUSED_INDEXER_VENDOR/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-export REQUEST_PLAN_VENDOR="$PWD/build/request-plan-opp/vendors/custom_transformer"
-export ASCEND_CUSTOM_OPP_PATH="$REQUEST_PLAN_VENDOR${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
-export LD_LIBRARY_PATH="$REQUEST_PLAN_VENDOR/op_api/lib:$REQUEST_PLAN_VENDOR/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+MAX_JOBS=4 python tools/build_fused_indexer_test_binding.py \
+  2>&1 | tee build/fused-logs/bridge-build.log
 ```
 
-如果安装器在目标环境中产生不同层级，以实际包含`op_api/`和`op_impl/`的vendor目录
-作为`REQUEST_PLAN_VENDOR`。保留生成kernel JSON和编译日志，便于核对目标芯片与源码。
+vendor 目录以安装器实际生成路径为准。测试桥接只注册融合算子和已有 transfer，
+在独立进程加载，不能与注册相同名称的完整插件扩展混用。
+本仓库 `ascend950` 生成目标为 `Ascend950PR_9599`，目标机器需确认实际型号兼容性。
 
-## 2. 编译最小Torch桥接
+## 测试
+
+CPU 测试执行融合算子实际使用的请求状态算法，包含并发原子和 barrier、ASan/UBSan、
+双向映射、free 栈、保护及淘汰、请求复用和回退；另外核对 host/device tiling ABI。
+这属于融合算子的内部测试，不调用独立 planner。
 
 ```bash
-MAX_JOBS=4 python tools/build_request_plan_test_binding.py \
-  2>&1 | tee build/request-plan-logs/bridge-build.log
+python tools/run_quant_lightning_indexer_sparse_kv_tests.py --suite static
 ```
 
-产物为 `build/request-plan-test-binding/request_plan_test_ops.so`。
-桥接使用生产适配头，注册planner与transfer两个Torch入口。它应在独立测试进程中
-使用，不能与已经注册相同`_C_ascend`算子的正式扩展同时加载。
-
-## 3. CPU算法检查
-
-```bash
-python -m pytest --confcutdir=tests/ut/kv_offload \
-  tests/ut/kv_offload/test_sparse_kv_request_plan.py -q
-```
-
-该测试编译并执行生产算法头，CPU线程/原子/barrier模拟SIMT执行，带ASan/UBSan。
-覆盖四行共享、重复token、全命中、空位充足/不足、优先级淘汰、请求替换、MTP回退、
-行重排、padding及非法页。它不替代950设备正确性。
-
-## 4. 950真实Graph和KV测试
-
-选择一张空闲950PR：
+950 真机验收只启动融合 QLI 和已有 transfer。用可精确预测的分组编码输入验证真实
+score/TopK，检查四行去重和请求级 KV 回搬。覆盖冷启动、全命中、满池淘汰、rollback、
+请求替换、行重排、padding、非法页、空输入和动态错误，以及连续 Graph replay。
+每轮核对双向映射、free 栈、miss 集合和 KV 内容。错误状态用融合调用测试且不搬运。
 
 ```bash
-python tools/check_sparse_kv_request_plan_npu.py \
+python tools/run_quant_lightning_indexer_sparse_kv_tests.py --suite device \
   --device 0 \
-  --library build/request-plan-test-binding/request_plan_test_ops.so \
-  --output test-results/request-plan-950-r1 \
-  2>&1 | tee build/request-plan-logs/device-check.log
+  --library build/fused-indexer-test-binding/fused_indexer_test_ops.so \
+  --output test-results/fused-950-r1
 ```
 
-输出目录必须尚不存在。测试明确拒绝910，使用2个请求、每请求4行、TopK2048、
-共享容量12288、32K逻辑上下文；K/V来自真实注册Host缓冲。
-先warmup和capture，再连续10次replay，改变输入、请求身份、行顺序、stable prefix
-及active rows。检查以下内容：
+输出目录必须不存在。仅全部检查完成后写 `result.json` 的 `passed=true`。
+还记录 B2/Q4/K2048/C8192/L32768 全命中融合调用时延（含 Python 入口的页表更新），
+不把它冒充完整模型或纯 kernel 性能；不与容量预算不同的旧按行路径计算加速比。
+旧逐行 ABI 的历史测试和三路径 benchmark 不属于本次验收入口。
 
-- 请求内重复token只产生一次miss，四行指向同一请求池的槽位。
-- miss集合匹配CPU参考，所有选中token的槽位有效。
-- 从Host回搬的K/V逐元素完全一致。
-- padding槽位输出为-1、inactive请求miss_count为0，Graph引用地址不变。
-- 双向映射互逆，planner完成后没有残留pending；回退修改Host内容后仍能精确回搬。
+## 本机验证记录（2026-10-28）
 
-成功会产生 `test-results/request-plan-950-r1/result.json`，其中`passed=true`。
-失败保留完整日志，不把部分replay通过当作整体通过。
-这个测试没有执行真实模型的score、TopK或attention，因此尚不能证明模型精度或加速。
-
-## 实现约束与后续性能测试
-
-`max_queries`表示每请求实际query行上限，MTP3设置4。第一版要求共享容量
-`C >= max_queries * TopK`，不允许union放不下却继续attention。
-状态按请求池位置归属，请求身份改变会清空该请求状态；跨调度位置移动会冷启动。
-缓存token唯一、free栈不重复由本算子维护，不能直接导入旧按行LRU表。
-
-反向表每个请求/层一份int32 `[L]`，B16、128K上下文为8 MiB/层/rank。
-初次创建时填-1；请求替换仅撤销旧缓存槽位对应项。MTP回退沿反向表清理
-`[stable_prefix,resident_end)`后缀，普通命中查找只遍历各行TopK。
-表内-2只表示本轮miss已经被某个线程认领，不表示KV已就绪。
-
-调用顺序是`TopK -> request plan -> request transfer -> attention`，同stream执行。
-planner更新的slot映射是计划状态，transfer完成后KV才可读取。每轮必须刷新
-active rows和输入元数据。`status`非零表示本次计划不可用，必须拒绝消费。
-生产部署仍需接入失败传播；当前Python的`check_status()`只用于capture/计时外检查。
-
-性能对照必须记录B、四行TopK重叠、union miss、C、冷/热状态及真实搬运字节。
-不要用“各行独立缓存的旧路径”和“请求共享的新路径”的不同容量预算隐瞒差异。
-目前没有950PR性能数据；先确认正确性，再测planner、transfer和完整Graph链路。
-
-详细设计、表大小、复杂度、Graph状态协议见
-[设计文档](docs/950pr_request_shared_planner.md)。本机已完成CPU测试、950PR交叉编译
-和Torch桥接编译加载，设备执行留给950PR机器验证。
+- 融合算子 CPU 验收 16 项通过，包含实际生产算法的 ASan/UBSan 并发测试。
+- Python 调用兼容保护和 CLI 回归各 8 项通过。
+- CANN 9.1 为 `Ascend950PR_9599` 生成 mixed AIC/AIV 二进制和安装包成功；
+  kernel 元数据标记 `intercoreSync=1`。这不是设备同步正确性的证明。
+- 最小 Torch 桥接编译、加载成功；修改的 Python 文件通过 Ruff 和语法检查。
+- 本机为 910，未执行融合算子的 950 精度、Graph 或性能验收。
+- `bash format.sh ci` 因缺少 pre-commit 未运行完成，不能声称完整格式检查通过。
