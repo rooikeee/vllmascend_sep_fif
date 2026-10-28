@@ -95,6 +95,11 @@ def main():
                 for row in range(8)])
             if step == 6:
                 stable.fill_(1024)
+                # Give rolled-back logical positions different payloads so a
+                # stale reverse-map hit cannot pass the KV-content comparison.
+                for tensor in host:
+                    tensor[1024:32768].add_(2)
+                    tensor[32768 + 1024:].add_(2)
             else:
                 stable.fill_(32768)
             if step == 7:
@@ -109,6 +114,10 @@ def main():
             row_owners, request_ids, prefixes = owners.cpu(), req.cpu(), stable.cpu()
             slots, tokens = plan.current_slots.cpu(), plan.slot_to_token.cpu()
             counts = plan.miss_count.cpu()
+            reverse = plan.token_to_slot.cpu()
+            free = plan.free_mask.cpu()
+            free_count = plan.free_count.cpu()
+            assert (reverse >= -1).all(), "A pending claim survived planner completion"
             for request in range(2):
                 rows = [row for row in range(active) if row_owners[row] == request]
                 selected = {int(token) for row in rows for token in inputs[row]}
@@ -118,6 +127,14 @@ def main():
                 assert int(counts[request]) == len(expected), (step, request, counts, len(expected))
                 actual = plan.miss_tokens[request, :int(counts[request])].cpu().tolist()
                 assert len(actual) == len(set(actual)) and set(actual) == expected
+                occupied = (tokens[request] >= 0).nonzero().flatten()
+                mapped_tokens = (reverse[request] >= 0).nonzero().flatten()
+                assert torch.equal(reverse[request, tokens[request, occupied].long()].long(), occupied)
+                assert torch.equal(tokens[request, reverse[request, mapped_tokens].long()].long(), mapped_tokens)
+                assert torch.equal(free[request].bool(), tokens[request] == -1)
+                stack = plan.free_stack[request, :int(free_count[request])].cpu().tolist()
+                assert len(stack) == len(set(stack)) == int(free[request].sum())
+                assert set(stack) == set((tokens[request] == -1).nonzero().flatten().tolist())
             for row in range(active):
                 request = int(row_owners[row])
                 assert torch.equal(tokens[request, slots[row].long()], inputs[row])

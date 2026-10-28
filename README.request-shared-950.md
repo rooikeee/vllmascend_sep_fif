@@ -11,8 +11,12 @@ cd vllmascend-request-shared
 ```
 
 这版新增实验算子 `SparseKvRequestPlan`，供950PR上编译、正确性检查和后续性能测量。
-MTP3四行共享请求缓存，union miss只搬一次；用free表/栈和时间戳优先级替换新路径
-中的完整LRU顺序维护。没有增加覆盖整个上下文的稠密token映射。
+MTP3四行共享请求级持久`token_to_slot[B,L]`反向表，直接查hit/miss，用CAS去重，
+同一个token只搬一次。已经删除临时hash及为匹配命中执行的全缓存扫描，
+用free表/栈和时间戳优先级替换完整LRU顺序维护。
+
+**反向表版更改了算子ABI，拉取更新后必须同时重编设备包和Torch桥接。**
+此前临时hash版的二进制不能与新代码混用。
 
 **目前是 TopK 后的独立 planner，不是已替换 serving 的融合 QLI。** 原服务仍走旧
 路径，直接启动原服务不会测到这版。第一版先验证请求级状态、分配和真实KV回搬；
@@ -30,6 +34,15 @@ QLI融合、IndexCache跨层接线、服务集成和预取尚未完成。
 ## 1. 编译两个设备算子
 
 同时编译planner和回搬算子，避免只安装planner后找不到transfer。
+
+如果是在旧版本checkout上更新，先移走旧`csrc/build`再构建。本仓库增量构建可能
+保留旧op-info/ACLNN接口和设备`.o`，日志显示成功也不代表接口已经更新。例如：
+
+```bash
+mkdir -p build
+# 仅在csrc/build存在、备份目标不存在时执行：
+mv csrc/build build/csrc-before-direct-map
+```
 
 ```bash
 set -o pipefail
@@ -98,6 +111,7 @@ python tools/check_sparse_kv_request_plan_npu.py \
 - miss集合匹配CPU参考，所有选中token的槽位有效。
 - 从Host回搬的K/V逐元素完全一致。
 - padding槽位输出为-1、inactive请求miss_count为0，Graph引用地址不变。
+- 双向映射互逆，planner完成后没有残留pending；回退修改Host内容后仍能精确回搬。
 
 成功会产生 `test-results/request-plan-950-r1/result.json`，其中`passed=true`。
 失败保留完整日志，不把部分replay通过当作整体通过。
@@ -109,6 +123,11 @@ python tools/check_sparse_kv_request_plan_npu.py \
 `C >= max_queries * TopK`，不允许union放不下却继续attention。
 状态按请求池位置归属，请求身份改变会清空该请求状态；跨调度位置移动会冷启动。
 缓存token唯一、free栈不重复由本算子维护，不能直接导入旧按行LRU表。
+
+反向表每个请求/层一份int32 `[L]`，B16、128K上下文为8 MiB/层/rank。
+初次创建时填-1；请求替换仅撤销旧缓存槽位对应项。MTP回退沿反向表清理
+`[stable_prefix,resident_end)`后缀，普通命中查找只遍历各行TopK。
+表内-2只表示本轮miss已经被某个线程认领，不表示KV已就绪。
 
 调用顺序是`TopK -> request plan -> request transfer -> attention`，同stream执行。
 planner更新的slot映射是计划状态，transfer完成后KV才可读取。每轮必须刷新

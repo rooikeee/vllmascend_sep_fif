@@ -3014,7 +3014,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor token_to_req, Tensor block_table, Tensor active_rows, Tensor(a!) last_req_ids, "
         "Tensor(b!) slot_to_token, Tensor(c!) priority, Tensor(d!) free_mask, Tensor(e!) free_stack, "
         "Tensor(f!) free_count, Tensor(g!) clock, Tensor(h!) current_slots, Tensor(i!) miss_count, "
-        "Tensor(j!) miss_tokens, Tensor(k!) miss_slots, Tensor(l!) workspace, Tensor(m!) status, "
+        "Tensor(j!) miss_tokens, Tensor(k!) miss_slots, Tensor(l!) token_to_slot, Tensor(m!) status, "
+        "Tensor(n!) resident_end, "
         "int max_queries, int max_token, int block_size, int host_num_blocks) -> ()");
     ops.impl("npu_sparse_kv_request_plan", torch::kPrivateUse1, &vllm_ascend::npu_sparse_kv_request_plan);
 

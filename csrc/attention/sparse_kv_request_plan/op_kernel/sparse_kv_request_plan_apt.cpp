@@ -7,7 +7,7 @@
 static_assert(sizeof(request_plan::Control) <= 1152, "Update host localBytes with Control layout");
 
 struct RequestPlanTilingData {
-  int32_t requests, rows, topk, capacity, maxToken, pages, hostBlocks, blockSize, maxQueries, hash;
+  int32_t requests, rows, topk, capacity, maxToken, pages, hostBlocks, blockSize, maxQueries;
   uint32_t localBytes;
 };
 
@@ -18,12 +18,13 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(request_plan::THREADS) inline void RunReques
     __gm__ int64_t* lastIds, __gm__ int32_t* tokens, __gm__ int64_t* priority,
     __gm__ int32_t* freeMask, __gm__ int32_t* freeStack, __gm__ int32_t* freeCount,
     __gm__ int64_t* clock, __gm__ int32_t* slots, __gm__ int32_t* missCount,
-    __gm__ int32_t* missTokens, __gm__ int32_t* missSlots, __gm__ int32_t* scratch, __gm__ int32_t* status,
+    __gm__ int32_t* missTokens, __gm__ int32_t* missSlots, __gm__ int32_t* tokenToSlot,
+    __gm__ int32_t* status, __gm__ int32_t* residentEnd,
     int32_t requests, int32_t rows, int32_t k, int32_t capacity, int32_t maxToken, int32_t pages,
-    int32_t hostBlocks, int32_t blockSize, int32_t maxQueries, int32_t hash, int32_t first, int32_t stride) {
+    int32_t hostBlocks, int32_t blockSize, int32_t maxQueries, int32_t first, int32_t stride) {
   request_plan::Context context{reqIds, topk, stable, visible, rowToReq, table, active, lastIds, tokens,
-      priority, freeMask, freeStack, freeCount, clock, slots, missCount, missTokens, missSlots, scratch, status};
-  request_plan::Shape shape{requests, rows, k, capacity, maxToken, pages, hostBlocks, blockSize, maxQueries, hash};
+      priority, freeMask, freeStack, freeCount, clock, slots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd};
+  request_plan::Shape shape{requests, rows, k, capacity, maxToken, pages, hostBlocks, blockSize, maxQueries};
   for (int32_t req = first; req < requests; req += stride) {
     request_plan::Process<request_plan::THREADS>(control, context, shape, req, threadIdx.x);
     asc_syncthreads();
@@ -33,8 +34,8 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(request_plan::THREADS) inline void RunReques
 extern "C" __global__ __aicore__ void sparse_kv_request_plan(
     GM_ADDR reqIds, GM_ADDR topk, GM_ADDR stable, GM_ADDR visible, GM_ADDR rowToReq, GM_ADDR table, GM_ADDR active,
     GM_ADDR lastIds, GM_ADDR tokens, GM_ADDR priority, GM_ADDR freeMask, GM_ADDR freeStack, GM_ADDR freeCount,
-    GM_ADDR clock, GM_ADDR slots, GM_ADDR missCount, GM_ADDR missTokens, GM_ADDR missSlots, GM_ADDR scratch,
-    GM_ADDR status, GM_ADDR workspace, GM_ADDR tiling) {
+    GM_ADDR clock, GM_ADDR slots, GM_ADDR missCount, GM_ADDR missTokens, GM_ADDR missSlots, GM_ADDR tokenToSlot,
+    GM_ADDR status, GM_ADDR residentEnd, GM_ADDR workspace, GM_ADDR tiling) {
   (void)workspace;
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   AscendC::InitSocState();
@@ -54,7 +55,8 @@ extern "C" __global__ __aicore__ void sparse_kv_request_plan(
       reinterpret_cast<__gm__ int32_t*>(freeCount), reinterpret_cast<__gm__ int64_t*>(clock),
       reinterpret_cast<__gm__ int32_t*>(slots), reinterpret_cast<__gm__ int32_t*>(missCount),
       reinterpret_cast<__gm__ int32_t*>(missTokens), reinterpret_cast<__gm__ int32_t*>(missSlots),
-      reinterpret_cast<__gm__ int32_t*>(scratch), reinterpret_cast<__gm__ int32_t*>(status),
-      t.requests, t.rows, t.topk, t.capacity, t.maxToken, t.pages, t.hostBlocks, t.blockSize, t.maxQueries, t.hash,
+      reinterpret_cast<__gm__ int32_t*>(tokenToSlot), reinterpret_cast<__gm__ int32_t*>(status),
+      reinterpret_cast<__gm__ int32_t*>(residentEnd),
+      t.requests, t.rows, t.topk, t.capacity, t.maxToken, t.pages, t.hostBlocks, t.blockSize, t.maxQueries,
       static_cast<int32_t>(AscendC::GetBlockIdx()), static_cast<int32_t>(AscendC::GetBlockNum()));
 }

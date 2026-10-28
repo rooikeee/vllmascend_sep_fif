@@ -11,12 +11,13 @@ inline void npu_sparse_kv_request_plan(
     const at::Tensor& rowToReq, const at::Tensor& table, const at::Tensor& active, const at::Tensor& lastIds,
     const at::Tensor& tokens, const at::Tensor& priority, const at::Tensor& freeMask, const at::Tensor& freeStack,
     const at::Tensor& freeCount, const at::Tensor& clock, const at::Tensor& slots, const at::Tensor& missCount,
-    const at::Tensor& missTokens, const at::Tensor& missSlots, const at::Tensor& scratch, const at::Tensor& status,
+    const at::Tensor& missTokens, const at::Tensor& missSlots, const at::Tensor& tokenToSlot,
+    const at::Tensor& status, const at::Tensor& residentEnd,
     int64_t maxQueries, int64_t maxToken, int64_t blockSize, int64_t hostBlocks) {
   const at::Tensor inputs[] = {reqIds, topk, stable, visible, rowToReq, table, active, lastIds, tokens,
-      priority, freeMask, freeStack, freeCount, clock, slots, missCount, missTokens, missSlots, scratch, status};
+      priority, freeMask, freeStack, freeCount, clock, slots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd};
   TORCH_CHECK(reqIds.device().is_privateuseone(), "SparseKvRequestPlan requires an Ascend 950 NPU");
-  for (int i = 0; i < 20; ++i) {
+  for (int i = 0; i < 21; ++i) {
     const auto type = (i == 0 || i == 7 || i == 9 || i == 13) ? at::kLong : at::kInt;
     TORCH_CHECK(inputs[i].device() == reqIds.device() && inputs[i].scalar_type() == type &&
                 inputs[i].is_contiguous(), "SparseKvRequestPlan tensor device/dtype/contiguity mismatch at ", i);
@@ -32,7 +33,7 @@ inline void npu_sparse_kv_request_plan(
   const c10_npu::OptionalNPUGuard guard(reqIds.device());
   EXEC_NPU_CMD(aclnnSparseKvRequestPlan, reqIds, topk, stable, visible, rowToReq, table, active,
       lastIds, tokens, priority, freeMask, freeStack, freeCount, clock, slots, missCount, missTokens,
-      missSlots, scratch, status, maxQueries, maxToken, blockSize, hostBlocks);
+      missSlots, tokenToSlot, status, residentEnd, maxQueries, maxToken, blockSize, hostBlocks);
 }
 }
 #endif

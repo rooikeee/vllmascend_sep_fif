@@ -20,10 +20,16 @@ inline int32_t asc_atomic_cas(int32_t* p, int32_t expected, int32_t value) {
   std::atomic_ref<int32_t>(*p).compare_exchange_strong(expected, value);
   return expected;
 }
+template <typename T> inline T asc_atomic_max(T* p, T value) {
+  std::atomic_ref<T> ref(*p);
+  T old = ref.load();
+  while (old < value && !ref.compare_exchange_weak(old, value)) {}
+  return old;
+}
 #include "request_plan_algorithm.h"
 
 struct Fixture {
-  request_plan::Shape s{2, 8, 4, 32, 1024, 256, 512, 4, 4, 32};
+  request_plan::Shape s{2, 8, 4, 32, 1024, 256, 512, 4, 4};
   std::vector<int64_t> ids{10, 20}, last{-1, -1}, priority = std::vector<int64_t>(64), clock{0, 0};
   std::vector<int32_t> topk = std::vector<int32_t>(32, -1), stable = std::vector<int32_t>(8, 1024);
   std::vector<int32_t> visible = std::vector<int32_t>(8, 1024), owners{0, 0, 0, 0, 1, 1, 1, 1};
@@ -31,12 +37,12 @@ struct Fixture {
   std::vector<int32_t> free = std::vector<int32_t>(64, 1), stack = std::vector<int32_t>(64), count{32, 32};
   std::vector<int32_t> slots = std::vector<int32_t>(32, -1), misses{0, 0};
   std::vector<int32_t> missTokens = std::vector<int32_t>(32, -1), missSlots = std::vector<int32_t>(32, -1);
-  std::vector<int32_t> scratch = std::vector<int32_t>(192), status{0, 0};
+  std::vector<int32_t> reverse = std::vector<int32_t>(2048, -1), status{0, 0}, residentEnd{0, 0};
   Fixture() { for (int i = 0; i < 512; ++i) table[i] = i; }
   request_plan::Context context() {
     return {ids.data(), topk.data(), stable.data(), visible.data(), owners.data(), table.data(), active.data(),
         last.data(), tokens.data(), priority.data(), free.data(), stack.data(), count.data(), clock.data(),
-        slots.data(), misses.data(), missTokens.data(), missSlots.data(), scratch.data(), status.data()};
+        slots.data(), misses.data(), missTokens.data(), missSlots.data(), reverse.data(), status.data(), residentEnd.data()};
   }
   void fill(int first, bool duplicates) {
     for (int row = 0; row < 8; ++row)
@@ -84,12 +90,21 @@ struct Fixture {
         const int token = tokens[req * 32 + slot];
         assert((token == -1) == bool(free[req * 32 + slot]));
         if (token == -1) freeSlots.insert(slot);
-        else assert(resident.insert(token).second);
+        else {
+          assert(resident.insert(token).second);
+          assert(reverse[req * 1024 + token] == slot);
+          assert(token < residentEnd[req]);
+        }
       }
       assert(int(freeSlots.size()) == count[req]);
       std::set<int> stackSlots;
       for (int i = 0; i < count[req]; ++i) assert(stackSlots.insert(stack[req * 32 + i]).second);
       assert(stackSlots == freeSlots);
+      for (int token = 0; token < 1024; ++token) {
+        const int slot = reverse[req * 1024 + token];
+        if (resident.count(token)) assert(slot >= 0 && slot < 32 && tokens[req * 32 + slot] == token);
+        else assert(slot == -1);
+      }
       for (int token : selected) assert(resident.count(token));
       // No unselected survivor may be older than an evicted valid old token.
       if (oldLast[req] == ids[req]) for (int slot = 0; slot < 32; ++slot) {
@@ -128,12 +143,25 @@ int main() {
   f.active[0] = 3; f.run<32>();
   f.active[0] = 0; f.run<32>();
   f.active[0] = 8; f.table[3] = -1; f.visible[0] = 12; f.topk[5] = -1; f.topk[6] = 5000; f.run<32>();
+  f.visible.assign(8, 1024); f.fill(1019, false); f.run<256>();
+  f.fill(1019, false); f.run<256>(); assert(f.misses[0] == 0 && f.misses[1] == 0);
+  f.stable.assign(8, 1020); f.run<32>();
   f.owners.assign(8, 0); f.run<32>(false); assert(f.status[0] == request_plan::BAD_ROWS && f.misses[0] == 0);
   for (int s : f.slots) assert(s == -1);
   Fixture g; g.fill(10, true); g.run<32>(); g.clock[0] = INT64_MAX; g.run<32>(false);
   assert(g.status[0] == request_plan::BAD_STATE && g.misses[0] == 0);
   Fixture h; h.fill(10, true); h.active[0] = 9; h.run<32>(false);
   assert(h.status[0] == request_plan::BAD_ROWS && h.status[1] == request_plan::BAD_ROWS);
+  Fixture bad; bad.fill(10, true); bad.run<32>();
+  bad.reverse[10] = 100; bad.topk[1] = 300; bad.run<32>(false);
+  assert(bad.status[0] == request_plan::BAD_STATE && bad.misses[0] == 0);
+  assert(std::find(bad.reverse.begin(), bad.reverse.end(), request_plan::PENDING) == bad.reverse.end());
+  Fixture random;
+  uint32_t seed = 17;
+  for (int step = 0; step < 40; ++step) {
+    for (int& token : random.topk) { seed = seed * 1664525U + 1013904223U; token = (seed >> 16) % 64; }
+    random.run<16>();
+  }
   std::cout << "Production request planner: shared MTP, cold/warm, eviction, radix boundaries, rollback, "
-               "reuse, row reordering, padding, invalid pages and error status passed\n";
+               "reuse, row reordering, reverse-map invariants, pending cleanup, padding, invalid pages and error status passed\n";
 }

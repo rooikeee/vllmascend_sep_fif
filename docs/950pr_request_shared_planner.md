@@ -9,8 +9,9 @@ MTP3 的四行 query 属于同一请求，历史 KV、缓存映射和淘汰状�
 共享，TopK 与槽位输出仍按 query 行保留。同一请求的不同 query 选中同一个 token
 时只分配、搬运一次。所有行选中项的并集在本次 attention 完成前均不得淘汰。
 
-第一版不增加按完整上下文分配的 `token_to_slot[R,L]` 稠密表。给请求内全部
-TopK 建临时 hash，扫描共享 `slot_to_token` 一次，在 hash 中记录命中槽位。
+采用持久的 `token_to_slot[B,L]` 反向映射，B是请求槽数，L是最大逻辑上下文。
+MTP四行共用一张表。直接查询和CAS认领缺失token，不再建立临时hash，
+也不再为了确认命中遍历C个缓存槽位。
 删除新路径中的 `lru_slots` 及其完整分类/重排，改为槽位时间戳、free 标记、
 free 栈、free_count。空闲够用时不运行淘汰选择；不够时只补足缺口。
 
@@ -35,11 +36,12 @@ IndexCache 跨层复用、serving 中 draft 行压缩等接线要在本算子通
 ## 数据结构
 
 B 是最大请求槽数；R 是最大 query 行数；Q 是单请求最大行数；K 是每行TopK；
-C 是共享热池容量；H 是不小于 `2*Q*K` 的2次幂，至少32。
+C 是共享热池容量；L是最大逻辑上下文长度。
 
 | 状态 | 类型与形状 | 生命周期 |
 | --- | --- | --- |
 | slot_to_token | int32 `[B,C]` | 每层持久 |
+| token_to_slot | int32 `[B,L]` | 每层持久；-1=未缓存，-2=本轮已认领，非负=槽位 |
 | priority | int64 `[B,C]` | 每层持久 |
 | free_mask / free_stack | int32 `[B,C]` 各一张 | 每层持久 |
 | free_count | int32 `[B]` | 每层持久 |
@@ -47,25 +49,33 @@ C 是共享热池容量；H 是不小于 `2*Q*K` 的2次幂，至少32。
 | current_slots | int32 `[R,K]` | 每轮更新，各行槽号相对请求池 |
 | miss_count | int32 `[B]` | 每轮更新，inactive请求置零 |
 | miss_tokens / miss_slots | int32 `[B,Q*K]` | 前miss_count项有效 |
-| workspace | int32 `[B,2H+C]` | 固定地址GM临时hash及保护标记 |
+| resident_end | int32 `[B]` | 缓存token编号上界，用于回退后缀失效 |
 | status | int32 `[B]` | 每轮错误位，非零不得消费结果 |
 
-无 O(L) 的持久映射。临时 hash 的 H 会随四行并集容量扩大，第一版采用 GM
-工作区；这可能增加原子/访存成本，需用 950 数据验证，不能预先承诺加速。
+反向表大小为4BL字节。例如B16、L131072是8 MiB/层/rank，不乘MTP四行。
+反向表在创建时初始化为-1，此后不每轮全量清空。没有hash工作区和逐轮保护数组；
+priority等于当前epoch表示本轮保护项。代价是持久映射容量及原子查询/更新，
+性能仍需950实测。
 每个 SIMT block 串行负责一个请求，不同请求并行，不存在同一请求多个 allocator
 同时修改 free_count。free/miss 压缩和同龄淘汰领取使用原子计数。
 
 ## 算法
 
 1. 根据 token_to_req 收集有效行；每行按 visible length、页表和token边界过滤。
-2. 请求身份改变时初始化共享池；对所有本请求TopK建立去重hash。
-3. 扫描一次C个槽位：失效 speculative suffix，归还free栈；命中项写hash槽位，
-   标记保护并更新时间戳。stable prefix取本请求各行的最小值，采用保守失效。
-4. 从hash压缩不同miss。free_count足够则直接从栈批量领取。
+2. 请求身份改变时扫描旧slot_to_token撤销对应反向映射、重置共享池和free栈，
+   不清空整个L。要求调用者第一次使用前初始化双向表，禁止导入不一致状态。
+3. stable prefix取本请求各行最小值；只遍历`[stable_prefix,resident_end)`的
+   逻辑token反向表，失效缓存的speculative suffix并归还free栈。resident_end
+   是保守上界，深回退时范围可较大，但不需要为正常命中查询全扫热缓存。
+4. 每个有效TopK token执行`CAS(token_to_slot[token], -1, -2)`。
+   返回-1的一方唯一拥有miss并追加输出；返回-2的重复项不重复分配、不自旋；
+   返回非负槽位的是hit，原子更新其priority为当前epoch。全部行处理完成后barrier。
+   free_count足够则直接从栈批量领取。
 5. 不足时，对未保护项做按字节的优先级radix选择，找第E小优先级。
    优先领取严格小于阈值项；阈值相等项原子领取剩余名额。只释放恰好E个。
-6. 从free栈分配M个槽位，更新slot_to_token、priority、free_mask与hash槽位。
-7. 四行各自查询hash，生成current_slots；重复token输出相同槽位。
+6. 淘汰时先撤销旧token的反向映射；从free栈分配M个槽位，更新slot_to_token、
+   priority、free_mask，将本轮miss的反向表项由-2更新为槽位。失败退出前清理本轮-2。
+7. 四行各自读取反向表，生成current_slots；重复token输出相同槽位。
 8. 同stream执行请求级transfer，再执行attention。planner更新的映射是计划，
    不是KV已就绪的证明；任何后续planner不得越过尚未完成的transfer读取该状态。
 
@@ -73,8 +83,9 @@ C 是共享热池容量；H 是不小于 `2*Q*K` 的2次幂，至少32。
 不能把union超过C时的部分结果交给attention。超出每请求Q行等动态错误写status，
 该请求miss_count为零、current_slots为-1；请求执行方必须将其视为失败。
 
-临时hash构建平均O(QK)，命中匹配O(C)，各行输出平均O(QK)。淘汰按优先级
-实际使用的字节数p扫描，O(pC)，仅缺空位时执行。没有全量LRU顺序写回。
+正常hit/miss判定和各行输出为O(QK)，不需要O(C)匹配。回退失效另有O(S)，S为
+上述后缀区间长度。淘汰按优先级实际使用的字节数p扫描，O(pC)，仅缺空位时执行。
+请求替换为O(C)，首次分配反向表为O(BL)。没有全量LRU顺序写回。
 每轮收集请求行另有O(BR)的简单元数据扫描，第一版可见且不隐瞒。
 
 ## 预取的后续位置
@@ -85,8 +96,8 @@ C 是共享热池容量；H 是不小于 `2*Q*K` 的2次幂，至少32。
 
 ## Graph 与验证
 
-所有持久表、输出和workspace在capture前分配，replay只更新内容。每轮重建hash、
-保护标记和miss_count；free栈及priority跨replay持久。padding行输出清-1，inactive
+所有持久表和输出在capture前分配，replay只更新内容。每轮重置miss_count，使用新
+epoch保护命中项；双向映射、resident_end、free栈及priority跨replay持久。padding行输出清-1，inactive
 请求miss_count清零。请求替换、行重排、长度变化、rollback、全命中、部分miss、
 无空位、空闲充足、重复token、非法页必须覆盖。host buffer生命周期覆盖所有replay。
 
@@ -100,7 +111,7 @@ KV内容核验，再比较旧per-row planner与新request-shared planner的实�
 - `vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_request_plan.py`：
   持久缓冲、请求级transfer及各query共享attention页表的实验接口。
 - `tests/ut/kv_offload/request_plan_host_test.cpp`：执行生产算法，CPU原子及barrier
-  替代SIMT原语，验证union miss、保护项、优先级顺序和free栈一致性。
+  替代SIMT原语，验证union miss、保护项、优先级顺序、双向映射和free栈一致性。
 - `tools/check_sparse_kv_request_plan_npu.py`：真实Host注册、请求级KV回搬、capture
   和连续replay，核验KV内容与固定地址。显式拒绝910设备。
 
@@ -138,9 +149,17 @@ python tools/check_sparse_kv_request_plan_npu.py \
 
 ## 2026-10-28 验证记录
 
+反向表版变更了ACLNN和Torch ABI：必须同时重编设备包与Torch桥接，不能混用此前
+临时hash版的`.so`或算子包。已移走旧csrc/build进行干净重建，核对新生成的ACLNN
+包含tokenToSlot和residentEnd，Torch schema为21个tensor加4个属性。
+新950PR二进制名为`SparseKvRequestPlan_71ae9c0c8ae1481f46baec0adb928f6b`，
+同包包含SparseKvTransfer。增量构建曾复用旧接口，因此README要求旧checkout清理构建目录。
+
 - 生产算法CPU并发测试通过，启用ASan/UBSan，覆盖256线程冷启动及32线程多轮状态转换。
   包含跨行重复、全命中、部分miss、空闲不足、radix字节边界、回退、请求替换、行重排、
-  padding、非法token/page以及错误状态。修复了一处错误标志更新导致的barrier分歧。
+  padding、非法token/page以及错误状态。另增加双向映射全量核验、最大token边界、
+  pending失败清理、256线程重复命中及40轮随机状态转换。修复了一处错误标志更新
+  导致的barrier分歧。
 - 原有planner oracle、miss选择和warp scan共7个相关测试通过。
 - CANN9.1生成950PR_9599的VectorCore设备二进制成功；上传profile原生记录为9589，
   目标机器仍须按其实际950PR型号重新构建/验证。host注册、tiling、ACLNN已编译。

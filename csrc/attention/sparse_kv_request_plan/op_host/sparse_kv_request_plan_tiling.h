@@ -13,7 +13,6 @@ TILING_DATA_FIELD_DEF(int32_t, pages);
 TILING_DATA_FIELD_DEF(int32_t, hostBlocks);
 TILING_DATA_FIELD_DEF(int32_t, blockSize);
 TILING_DATA_FIELD_DEF(int32_t, maxQueries);
-TILING_DATA_FIELD_DEF(int32_t, hash);
 TILING_DATA_FIELD_DEF(uint32_t, localBytes);
 END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(SparseKvRequestPlan, RequestPlanTilingData)

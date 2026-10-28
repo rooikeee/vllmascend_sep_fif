@@ -19,7 +19,6 @@ class SparseKVRequestPlan:
         self.max_queries, self.topk, self.capacity = max_queries, topk, capacity
         self.max_token, self.block_size, self.host_num_blocks = max_token, block_size, host_num_blocks
         self.union_capacity = max_queries * topk
-        self.hash_capacity = max(32, 1 << (2 * self.union_capacity - 1).bit_length())
         i32 = {"dtype": torch.int32, "device": device}
         i64 = {"dtype": torch.int64, "device": device}
         self.last_req_ids = torch.full((max_requests,), -1, **i64)
@@ -33,7 +32,8 @@ class SparseKVRequestPlan:
         self.miss_count = torch.zeros(max_requests, **i32)
         self.miss_tokens = torch.full((max_requests, self.union_capacity), -1, **i32)
         self.miss_slots = torch.full_like(self.miss_tokens, -1)
-        self.workspace = torch.empty((max_requests, 2 * self.hash_capacity + capacity), **i32)
+        self.token_to_slot = torch.full((max_requests, max_token), -1, **i32)
+        self.resident_end = torch.zeros(max_requests, **i32)
         self.status = torch.zeros(max_requests, **i32)
         self.active_rows = torch.zeros(1, **i32)
         # Transfer rows are requests, so its existing row*C addressing is shared.
@@ -52,7 +52,7 @@ class SparseKVRequestPlan:
             req_ids, topk_indices, stable_prefix_lens, visible_seq_lens, token_to_req,
             block_table, self.active_rows, self.last_req_ids, self.slot_to_token, self.priority,
             self.free_mask, self.free_stack, self.free_count, self.clock, self.current_slots,
-            self.miss_count, self.miss_tokens, self.miss_slots, self.workspace, self.status,
+            self.miss_count, self.miss_tokens, self.miss_slots, self.token_to_slot, self.status, self.resident_end,
             self.max_queries, self.max_token, self.block_size, self.host_num_blocks)
         # Padding has -1 indices; clamp its page-table owner to an allocated row.
         torch.clamp(token_to_req, 0, self.max_requests - 1, out=self.safe_requests)

@@ -17,8 +17,8 @@ bool Match(const gert::Shape& shape, int64_t a, int64_t b = -1) {
 }
 }
 static ge::graphStatus Tile(gert::TilingContext* c) {
-  const gert::Shape* shapes[20];
-  for (uint32_t i = 0; i < 20; ++i) {
+  const gert::Shape* shapes[21];
+  for (uint32_t i = 0; i < 21; ++i) {
     const auto* shape = c->GetInputShape(i);
     const auto* desc = c->GetInputDesc(i);
     const auto type = (i == 0 || i == 7 || i == 9 || i == 13) ? ge::DT_INT64 : ge::DT_INT32;
@@ -48,17 +48,15 @@ static ge::graphStatus Tile(gert::TilingContext* c) {
       capacity < q * k || capacity > (1 << 24) || maxToken <= 0 || maxToken > INT32_MAX ||
       pages <= 0 || pages > INT32_MAX || block <= 0 || block > INT32_MAX || host <= 0 || host > INT32_MAX)
     return Fail(c, "Invalid capacity or dimensions; capacity must cover maxQueries*topk");
-  int32_t hash = 32;
-  while (hash < 2 * q * k) hash <<= 1;
   for (int i : {2, 3, 4}) if (!Match(*shapes[i], r)) return Fail(c, "Row metadata shape mismatch");
-  for (int i : {7, 12, 13, 15, 19}) if (!Match(*shapes[i], b)) return Fail(c, "Request state shape mismatch");
+  for (int i : {7, 12, 13, 15, 19, 20}) if (!Match(*shapes[i], b)) return Fail(c, "Request state shape mismatch");
   for (int i : {8, 9, 10, 11}) if (!Match(*shapes[i], b, capacity)) return Fail(c, "Cache state shape mismatch");
   for (int i : {16, 17}) if (!Match(*shapes[i], b, q * k)) return Fail(c, "Union miss shape mismatch");
   if (!Match(*shapes[5], b, pages) || !Match(*shapes[6], 1) || !Match(*shapes[14], r, k) ||
-      !Match(*shapes[18], b, 2 * hash + capacity)) return Fail(c, "Output/workspace shape mismatch");
+      !Match(*shapes[18], b, maxToken)) return Fail(c, "Output/reverse-map shape mismatch");
   RequestPlanTilingData t;
   t.set_requests(b); t.set_rows(r); t.set_topk(k); t.set_capacity(capacity); t.set_maxToken(maxToken);
-  t.set_pages(pages); t.set_hostBlocks(host); t.set_blockSize(block); t.set_maxQueries(q); t.set_hash(hash);
+  t.set_pages(pages); t.set_hostBlocks(host); t.set_blockSize(block); t.set_maxQueries(q);
   // Rounded storage for Control; the kernel checks this bound at compile time.
   constexpr uint32_t localBytes = 1152;
   t.set_localBytes(localBytes);

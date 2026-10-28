@@ -9,12 +9,13 @@ namespace request_plan {
 constexpr uint32_t THREADS = 256;
 constexpr int32_t MAX_QUERY_ROWS = 16;
 constexpr int32_t INVALID = -1;
+constexpr int32_t PENDING = -2;
 constexpr int32_t BAD_ROWS = 1;
 constexpr int32_t BAD_STATE = 2;
 constexpr int32_t NO_CAPACITY = 4;
 
 struct Shape {
-  int32_t requests, rows, topk, capacity, maxToken, pages, hostBlocks, blockSize, maxQueries, hash;
+  int32_t requests, rows, topk, capacity, maxToken, pages, hostBlocks, blockSize, maxQueries;
 };
 
 struct Context {
@@ -25,46 +26,17 @@ struct Context {
   __gm__ int64_t *priority;
   __gm__ int32_t *freeMask, *freeStack, *freeCount;
   __gm__ int64_t *clock;
-  __gm__ int32_t *slots, *missCount, *missTokens, *missSlots, *workspace, *status;
+  __gm__ int32_t *slots, *missCount, *missTokens, *missSlots, *tokenToSlot, *status, *residentEnd;
 };
 
 // One block owns one request. Barriers protect scratch and state between phases.
 struct Control {
   int32_t rowIds[MAX_QUERY_ROWS];
   int32_t rowCount, stable, active, reset, failed, freeBefore, misses, evictions, equalCount;
+  int32_t residentEnd, nextEnd;
   int32_t histogram[256];
   uint64_t epoch, threshold;
 };
-
-__simt_callee__ __aicore__ inline uint32_t Hash(int32_t token, int32_t size) {
-  uint32_t x = static_cast<uint32_t>(token);
-  x ^= x >> 16;
-  x *= 0x7feb352dU;
-  x ^= x >> 15;
-  x *= 0x846ca68bU;
-  x ^= x >> 16;
-  return x & (size - 1);
-}
-
-__simt_callee__ __aicore__ inline int32_t Find(__gm__ int32_t* keys, int32_t token, int32_t size) {
-  uint32_t bucket = Hash(token, size);
-  for (int32_t i = 0; i < size; ++i) {
-    const int32_t key = keys[bucket];
-    if (key == token) return static_cast<int32_t>(bucket);
-    if (key == INVALID) return INVALID;
-    bucket = (bucket + 1) & (size - 1);
-  }
-  return INVALID;
-}
-
-__simt_callee__ __aicore__ inline void Insert(__gm__ int32_t* keys, int32_t token, int32_t size) {
-  uint32_t bucket = Hash(token, size);
-  for (int32_t i = 0; i < size; ++i) {
-    const int32_t old = asc_atomic_cas(keys + bucket, INVALID, token);
-    if (old == INVALID || old == token) return;
-    bucket = (bucket + 1) & (size - 1);
-  }
-}
 
 __simt_callee__ __aicore__ inline bool Valid(const Context& c, const Shape& s, int32_t req,
                                            int32_t row, int32_t token) {
@@ -81,9 +53,7 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
   const int64_t base = static_cast<int64_t>(req) * s.capacity;
   const int32_t unionSize = s.maxQueries * s.topk;
   const int64_t missBase = static_cast<int64_t>(req) * unionSize;
-  auto keys = c.workspace + static_cast<int64_t>(req) * (2 * s.hash + s.capacity);
-  auto owners = keys + s.hash;
-  auto protectedSlots = owners + s.hash;
+  auto reverse = c.tokenToSlot + static_cast<int64_t>(req) * s.maxToken;
   if (thread == 0) {
     c.missCount[req] = 0;
     c.status[req] = 0;
@@ -124,8 +94,12 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
   if (thread == 0) {
     w->reset = c.lastIds[req] != c.reqIds[req];
     w->epoch = w->reset ? 1 : static_cast<uint64_t>(c.clock[req]) + 1;
+    w->residentEnd = w->reset ? 0 : c.residentEnd[req];
+    w->nextEnd = w->residentEnd < w->stable ? w->residentEnd : w->stable;
+    w->misses = 0;
     if (!w->reset && (c.clock[req] < 0 || c.clock[req] == INT64_MAX ||
-                     c.freeCount[req] < 0 || c.freeCount[req] > s.capacity)) {
+                     c.freeCount[req] < 0 || c.freeCount[req] > s.capacity ||
+                     w->residentEnd < 0 || w->residentEnd > s.maxToken)) {
       w->failed = BAD_STATE;
       c.status[req] = BAD_STATE;
     }
@@ -133,10 +107,12 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
   }
   asc_syncthreads();
   if (w->failed) return;
-  for (int32_t h = thread; h < s.hash; h += Threads) { keys[h] = INVALID; owners[h] = INVALID; }
-  for (int32_t slot = thread; slot < s.capacity; slot += Threads) {
-    protectedSlots[slot] = 0;
-    if (w->reset) {
+  if (w->reset) {
+    // The reverse table is initialized once to -1. Request replacement only
+    // clears entries belonging to occupied slots, not the full logical context.
+    for (int32_t slot = thread; slot < s.capacity; slot += Threads) {
+      const int32_t oldToken = c.tokens[base + slot];
+      if (oldToken >= 0 && oldToken < s.maxToken) reverse[oldToken] = INVALID;
       c.tokens[base + slot] = INVALID;
       c.priority[base + slot] = 0;
       c.freeMask[base + slot] = 1;
@@ -144,42 +120,48 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
     }
   }
   asc_syncthreads();
-  for (int32_t q = 0; q < w->rowCount; ++q) {
-    const int32_t row = w->rowIds[q];
-    for (int32_t k = thread; k < s.topk; k += Threads) {
-      const int32_t token = c.topk[static_cast<int64_t>(row) * s.topk + k];
-      if (Valid(c, s, req, row, token)) Insert(keys, token, s.hash);
-    }
-  }
-  asc_syncthreads();
-  for (int32_t slot = thread; slot < s.capacity; slot += Threads) {
-    int32_t token = c.tokens[base + slot];
-    if (token != INVALID && token >= w->stable) {
+  // Only the previously cached speculative suffix needs invalidation. This
+  // bound may overestimate after eviction, but never misses a resident token.
+  for (int64_t token = static_cast<int64_t>(w->stable) + thread; token < w->residentEnd; token += Threads) {
+    const int32_t slot = reverse[token];
+    if (slot >= 0 && slot < s.capacity) {
+      reverse[token] = INVALID;
       c.tokens[base + slot] = INVALID;
       c.freeMask[base + slot] = 1;
       const int32_t pos = asc_atomic_add(c.freeCount + req, 1);
       c.freeStack[base + pos] = slot;
-      token = INVALID;
     }
-    if (token != INVALID) {
-      const int32_t bucket = Find(keys, token, s.hash);
-      if (bucket >= 0) {
-        owners[bucket] = slot;
-        protectedSlots[slot] = 1;
-        c.priority[base + slot] = static_cast<int64_t>(w->epoch);
+  }
+  asc_syncthreads();
+  for (int32_t q = 0; q < w->rowCount; ++q) {
+    const int32_t row = w->rowIds[q];
+    for (int32_t k = thread; k < s.topk; k += Threads) {
+      const int32_t token = c.topk[static_cast<int64_t>(row) * s.topk + k];
+      if (!Valid(c, s, req, row, token)) continue;
+      asc_atomic_max(&w->nextEnd, token + 1);
+      // CAS also serves as an atomic read of existing/pending mappings. Exactly
+      // one occurrence across all MTP rows owns a new miss; nobody spins.
+      const int32_t slot = asc_atomic_cas(reverse + token, INVALID, PENDING);
+      if (slot == INVALID) {
+        const int32_t pos = asc_atomic_add(&w->misses, 1);
+        c.missTokens[missBase + pos] = token;
+      } else if (slot >= 0 && slot < s.capacity && c.tokens[base + slot] == token) {
+        // Duplicate hits can touch the same slot; use an atomic timestamp update.
+        asc_atomic_max(c.priority + base + slot, static_cast<int64_t>(w->epoch));
+      } else if (slot != PENDING) {
+        asc_atomic_max(&w->failed, BAD_STATE);
       }
     }
   }
   asc_syncthreads();
-  for (int32_t h = thread; h < s.hash; h += Threads) {
-    if (keys[h] != INVALID && owners[h] == INVALID) {
-      const int32_t pos = asc_atomic_add(c.missCount + req, 1);
-      c.missTokens[missBase + pos] = keys[h];
-    }
+  if (w->failed) {
+    for (int32_t m = thread; m < w->misses; m += Threads) reverse[c.missTokens[missBase + m]] = INVALID;
+    if (thread == 0) c.status[req] = w->failed;
+    asc_syncthreads();
+    return;
   }
-  asc_syncthreads();
   if (thread == 0) {
-    w->misses = c.missCount[req];
+    c.missCount[req] = w->misses;
     w->freeBefore = c.freeCount[req];
     w->evictions = w->misses > w->freeBefore ? w->misses - w->freeBefore : 0;
     w->threshold = 0;
@@ -195,7 +177,7 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
       asc_syncthreads();
       for (int32_t slot = thread; slot < s.capacity; slot += Threads) {
         const uint64_t age = static_cast<uint64_t>(c.priority[base + slot]);
-        if (!c.freeMask[base + slot] && !protectedSlots[slot] && (age & prefixMask) == w->threshold) {
+        if (!c.freeMask[base + slot] && age != w->epoch && (age & prefixMask) == w->threshold) {
           asc_atomic_add(w->histogram + ((age >> shift) & 255), 1);
         }
       }
@@ -212,13 +194,16 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
       prefixMask |= static_cast<uint64_t>(255) << shift;
     }
     if (w->failed) {
+      for (int32_t m = thread; m < w->misses; m += Threads) reverse[c.missTokens[missBase + m]] = INVALID;
       if (thread == 0) { c.status[req] = w->failed; c.missCount[req] = 0; }
+      asc_syncthreads();
       return;
     }
     // All strictly older slots are selected first; ties use the remaining budget.
     for (int32_t slot = thread; slot < s.capacity; slot += Threads) {
-      if (!c.freeMask[base + slot] && !protectedSlots[slot] &&
+      if (!c.freeMask[base + slot] && static_cast<uint64_t>(c.priority[base + slot]) != w->epoch &&
           static_cast<uint64_t>(c.priority[base + slot]) < w->threshold) {
+        reverse[c.tokens[base + slot]] = INVALID;
         c.freeMask[base + slot] = 1;
         c.tokens[base + slot] = INVALID;
         const int32_t pos = asc_atomic_add(c.freeCount + req, 1);
@@ -229,10 +214,11 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
     if (thread == 0) { w->equalCount = w->misses - c.freeCount[req]; w->histogram[0] = 0; }
     asc_syncthreads();
     for (int32_t slot = thread; slot < s.capacity; slot += Threads) {
-      if (!c.freeMask[base + slot] && !protectedSlots[slot] &&
+      if (!c.freeMask[base + slot] && static_cast<uint64_t>(c.priority[base + slot]) != w->epoch &&
           static_cast<uint64_t>(c.priority[base + slot]) == w->threshold) {
         const int32_t ticket = asc_atomic_add(w->histogram, 1);
         if (ticket < w->equalCount) {
+          reverse[c.tokens[base + slot]] = INVALID;
           c.freeMask[base + slot] = 1;
           c.tokens[base + slot] = INVALID;
           const int32_t pos = asc_atomic_add(c.freeCount + req, 1);
@@ -248,7 +234,11 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
     else c.freeCount[req] = w->freeBefore - w->misses;
   }
   asc_syncthreads();
-  if (w->failed) return;
+  if (w->failed) {
+    for (int32_t m = thread; m < w->misses; m += Threads) reverse[c.missTokens[missBase + m]] = INVALID;
+    asc_syncthreads();
+    return;
+  }
   for (int32_t m = thread; m < w->misses; m += Threads) {
     const int32_t token = c.missTokens[missBase + m];
     const int32_t slot = c.freeStack[base + w->freeBefore - 1 - m];
@@ -256,7 +246,7 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
     c.priority[base + slot] = static_cast<int64_t>(w->epoch);
     c.freeMask[base + slot] = 0;
     c.missSlots[missBase + m] = slot;
-    owners[Find(keys, token, s.hash)] = slot;
+    reverse[token] = slot;
   }
   asc_syncthreads();
   for (int32_t q = 0; q < w->rowCount; ++q) {
@@ -264,10 +254,14 @@ __simt_callee__ __aicore__ inline void Process(__ubuf__ Control* w, const Contex
     for (int32_t k = thread; k < s.topk; k += Threads) {
       const int64_t pos = static_cast<int64_t>(row) * s.topk + k;
       const int32_t token = c.topk[pos];
-      if (Valid(c, s, req, row, token)) c.slots[pos] = owners[Find(keys, token, s.hash)];
+      if (Valid(c, s, req, row, token)) c.slots[pos] = reverse[token];
     }
   }
-  if (thread == 0) { c.lastIds[req] = c.reqIds[req]; c.clock[req] = static_cast<int64_t>(w->epoch); }
+  if (thread == 0) {
+    c.lastIds[req] = c.reqIds[req];
+    c.clock[req] = static_cast<int64_t>(w->epoch);
+    c.residentEnd[req] = w->nextEnd;
+  }
   asc_syncthreads();
 }
 }  // namespace request_plan
