@@ -51,6 +51,7 @@ public:
     __aicore__ inline void InitVecInputTensor(GlobalTensor<W_T> weightsGm, GlobalTensor<SCALE_T> qScaleGm,
                                               GlobalTensor<SCALE_T> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<int32_t> blockTableGm);
+    __aicore__ inline void InitBlockMissProbe(const BlockMissProbeContext& context) { probe_ = context; }
     __aicore__ inline void PlanRequests(const request_plan::Context& context, const request_plan::Shape& shape);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void ProcessInvalidRow(int64_t row);
@@ -83,6 +84,7 @@ protected:
     static constexpr uint32_t V_MTE2_EVENT3 = EVENT_ID5;
 
 private:
+    BlockMissProbeContext probe_{};
     __aicore__ inline void GetKeyScale(const QLICommon::RunInfo& runInfo, LocalTensor<SCALE_T>& kScaleUB,
                                        int64_t batchId, int64_t startS2, int64_t getLen);
     // ================================Local Buffer区====================================
@@ -283,6 +285,10 @@ template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::CleanInvalidOutput(int64_t invalidS1Offset)
 {
     PipeBarrier<PIPE_ALL>();
+    if (probe_.mode != block_miss_probe::DISABLED) {
+        asc_vf_call<ClearBlockProbeRow>(dim3(1), probe_.stats, invalidS1Offset / constInfo_.sparseCount);
+        PipeBarrier<PIPE_V>();
+    }
     Duplicate(outInvalidLocal_, constInfo_.INVALID_IDX, constInfo_.sparseCount);
     PipeBarrier<PIPE_ALL>();
 
@@ -456,6 +462,25 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo& in
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT +
                                                                    pingpong); // V核处理完，通知C核可以把mm1Res搬运到UB
+
+    if (probe_.mode != block_miss_probe::DISABLED) {
+        // QK UB is already released to Cube; score MTE3 and this read-only probe
+        // may proceed together. TopK scratch is dead until the last score block.
+        static_assert(sizeof(block_miss_probe::Control) <= QLI_TOPK_SLAB_BYTES);
+        PipeBarrier<PIPE_V>();
+        asc_vf_call<RunBlockMissProbe>(dim3(block_miss_probe::THREADS),
+            reinterpret_cast<__ubuf__ block_miss_probe::Control*>(mrgValueLocal_.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ const uint16_t*>(outBase.GetPhyAddr()), probe_.thresholds, probe_.stats,
+            probe_.state.reqIds, probe_.state.lastIds, probe_.state.tokenToSlot,
+            probe_.state.stable, probe_.state.visible, probe_.state.rowToReq, probe_.state.active,
+            probe_.shape.requests, probe_.shape.rows, probe_.shape.capacity, probe_.shape.maxToken, probe_.mode,
+            static_cast<int32_t>(info.indiceOutOffset / topkCount_ + curAivS1Idx),
+            static_cast<int32_t>(curAivS1ProcNum), curS2Idx,
+            static_cast<int32_t>(UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T)),
+            static_cast<int64_t>(info.actS2SizeOrig) - info.actS1Size + curAivS1Idx + 1,
+            info.isFirstS2InnerLoop, info.isLastS2InnerLoop);
+        PipeBarrier<PIPE_V>();
+    }
 }
 
 template <typename QLIT>

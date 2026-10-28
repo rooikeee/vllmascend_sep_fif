@@ -1,3 +1,7 @@
+> 当前实验分支 `perf/950pr-fused-block-miss-probe`：每个 AIV score block 后增加阈值候选的
+> 只读反向表查询，保留最终 TopK 规划，不预取。三档对照与运行命令见
+> [block miss 查询实验](docs/950pr_fused_block_miss_probe.md)。
+
 > **950PR 优化范围：只优化融合算子 `QuantLightningIndexerSparseKv`，测试和性能验收也只针对融合算子。**
 > 反向表、free 栈、MTP 请求共享均在同一次融合 kernel 内执行；不再开发或验收独立 planner。
 > 构建与测试见 [融合算子说明](README.request-shared-950.md)。

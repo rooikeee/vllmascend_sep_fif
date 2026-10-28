@@ -60,11 +60,12 @@ def test_fused_dispatch_reuses_request_state_and_page_tables(monkeypatch):
         assert state.select_and_plan(**inputs).shape == (8, 1, 2048)
     assert len(seen) == 2
     args = seen[0]
-    assert len(args) == 33  # 28 tensors and five attributes; one fused dispatch
+    assert len(args) == 36  # 30 tensors and six attributes; one fused dispatch
     assert args[15] is state.slot_to_token and args[16] is state.priority
     assert args[18] is state.free_stack and args[19] is state.free_count
     assert args[25] is state.token_to_slot and args[26] is state.status
-    assert args[28:] == (8192, 32768, 128, 512, 4)
+    assert args[28] is state.probe_thresholds and args[29] is state.probe_stats
+    assert args[30:] == (8192, 32768, 128, 512, 4, 0)
     assert state.slot_to_token.shape == (2, 8192)
     assert state.miss_tokens.shape == (2, 8192)
     assert torch.equal(state.attention_page_table[0], state.request_page_table[1])
@@ -72,6 +73,12 @@ def test_fused_dispatch_reuses_request_state_and_page_tables(monkeypatch):
     assert pointers == {
         name: tensor.data_ptr() for name, tensor in vars(state).items() if isinstance(tensor, torch.Tensor)
     }
+    state.probe_mode = 2
+    state.probe_thresholds.fill_(0.5)
+    state.attention_page_table.fill_(-7)
+    state.select_and_plan(**inputs, update_page_table=False)
+    assert seen[-1][-1] == 2
+    assert (state.attention_page_table == -7).all()
     state.status[0] = 2
     with pytest.raises(RuntimeError, match="status"):
         state.check_status()

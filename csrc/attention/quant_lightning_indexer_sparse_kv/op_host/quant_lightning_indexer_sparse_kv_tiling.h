@@ -45,6 +45,7 @@ TILING_DATA_FIELD_DEF(int64_t, maxNumBlocks)
 TILING_DATA_FIELD_DEF(int64_t, hostNumBlocks)
 TILING_DATA_FIELD_DEF(int32_t, planBlockSize)
 TILING_DATA_FIELD_DEF(int32_t, maxQueries)
+TILING_DATA_FIELD_DEF(int32_t, probeMode)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(QuantLightningIndexerSparseKv, QuantLightningIndexerSparseKvTilingData)
 
@@ -64,6 +65,7 @@ struct QuantLightningIndexerSparseKvInfo {
   int64_t maxNumBlocks = 0;
   int64_t hostNumBlocks = 0;
   int32_t maxQueries = 0;
+  int32_t probeMode = 0;
 };
 
 ge::graphStatus TilingForQuantLightningIndexerSparseKv(gert::TilingContext* context);

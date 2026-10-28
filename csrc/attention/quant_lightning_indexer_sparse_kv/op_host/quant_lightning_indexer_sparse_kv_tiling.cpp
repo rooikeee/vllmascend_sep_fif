@@ -49,6 +49,8 @@ constexpr uint32_t MISS_SLOTS_INDEX = 24U;
 constexpr uint32_t TOKEN_TO_SLOT_INDEX = 25U;
 constexpr uint32_t STATUS_INDEX = 26U;
 constexpr uint32_t RESIDENT_END_INDEX = 27U;
+constexpr uint32_t PROBE_THRESHOLDS_INDEX = 28U;
+constexpr uint32_t PROBE_STATS_INDEX = 29U;
 constexpr uint32_t OUTPUT_INDEX = 0U;
 
 constexpr uint32_t ATTR_QUERY_QUANT_MODE_INDEX = 0U;
@@ -67,6 +69,7 @@ constexpr uint32_t ATTR_PLAN_BLOCK_SIZE_INDEX = 12U;
 constexpr uint32_t ATTR_HOST_NUM_BLOCKS_INDEX = 13U;
 
 constexpr uint32_t ATTR_MAX_QUERIES_INDEX = 14U;
+constexpr uint32_t ATTR_PROBE_MODE_INDEX = 15U;
 
 constexpr uint32_t HEADS = 32U;
 constexpr uint32_t HEAD_DIM = 128U;
@@ -259,6 +262,9 @@ ge::graphStatus ValidateFixedIndexer(gert::TilingContext* context, QuantLightnin
     return Fail(context, "request pool must cover max_queries*2048 with 1..16 query rows");
   }
   info.maxQueries = static_cast<int32_t>(*maxQueries);
+  const int64_t* mode = attrs->GetInt(ATTR_PROBE_MODE_INDEX);
+  if (mode == nullptr || *mode < 0 || *mode > qli_sparse_kv_contract::PROBE_MAX_MODE) return Fail(context, "probe_mode must be 0, 1 or 2");
+  info.probeMode = static_cast<int32_t>(*mode);
   return ge::GRAPH_SUCCESS;
 }
 
@@ -283,7 +289,8 @@ ge::graphStatus ValidatePlanner(gert::TilingContext* context, QuantLightningInde
       {CLOCK_INDEX, ge::DT_INT64, b, 0}, {CURRENT_SLOTS_INDEX, ge::DT_INT32, r, qli_sparse_kv_contract::TOPK},
       {MISS_COUNT_INDEX, ge::DT_INT32, b, 0}, {MISS_TOKENS_INDEX, ge::DT_INT32, b, unionSize},
       {MISS_SLOTS_INDEX, ge::DT_INT32, b, unionSize}, {TOKEN_TO_SLOT_INDEX, ge::DT_INT32, b, info.maxToken},
-      {STATUS_INDEX, ge::DT_INT32, b, 0}, {RESIDENT_END_INDEX, ge::DT_INT32, b, 0}};
+      {STATUS_INDEX, ge::DT_INT32, b, 0}, {RESIDENT_END_INDEX, ge::DT_INT32, b, 0},
+      {PROBE_THRESHOLDS_INDEX, ge::DT_FLOAT, r, 0}, {PROBE_STATS_INDEX, ge::DT_INT32, r, qli_sparse_kv_contract::PROBE_STAT_COLUMNS}};
   for (const auto& input : inputs) {
     const auto* storage = context->GetInputShape(input.index);
     if (storage == nullptr || !HasDataType(context, input.index, input.type)) {
@@ -339,6 +346,7 @@ ge::graphStatus WriteTiling(gert::TilingContext* context, const QuantLightningIn
   tiling.set_hostNumBlocks(info.hostNumBlocks);
   tiling.set_planBlockSize(BLOCK_SIZE);
   tiling.set_maxQueries(info.maxQueries);
+  tiling.set_probeMode(info.probeMode);
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 

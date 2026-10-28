@@ -55,8 +55,9 @@ inline void ValidateInputs(const at::Tensor& query, const at::Tensor& key, const
                            const at::Tensor& currentSlots,
                            const at::Tensor& missCount, const at::Tensor& missTokens, const at::Tensor& missSlots,
                            const at::Tensor& tokenToSlot, const at::Tensor& status, const at::Tensor& residentEnd,
+                           const at::Tensor& probeThresholds, const at::Tensor& probeStats,
                            int64_t capacity, int64_t maxToken, int64_t blockSize,
-                           int64_t hostNumBlocks, int64_t maxQueries) {
+                           int64_t hostNumBlocks, int64_t maxQueries, int64_t probeMode) {
   const at::Device device = query.device();
   TORCH_CHECK(query.is_privateuseone(), "query must be an NPU tensor");
   CheckTensor(query, "query", at::kFloat8_e4m3fn, 3, device);
@@ -89,21 +90,22 @@ inline void ValidateInputs(const at::Tensor& query, const at::Tensor& key, const
               blockSize == kHeadDim && capacity % blockSize == 0 && maxToken > 0 &&
               maxToken <= std::numeric_limits<int32_t>::max() && hostNumBlocks > 0 &&
               hostNumBlocks <= std::numeric_limits<int32_t>::max(), "invalid request-pool attributes");
+  TORCH_CHECK(probeMode >= 0 && probeMode <= contract::PROBE_MAX_MODE, "probe_mode must be 0, 1 or 2");
   const int64_t requests = actualSeqLengthsQuery.numel();
   TORCH_CHECK(requests <= std::numeric_limits<int32_t>::max() && rows <= std::numeric_limits<int32_t>::max(),
               "request/row count exceeds SIMT indexing range");
   const at::Tensor inputs[] = {reqIds, stablePrefixLens, visibleSeqLens, tokenToReq, kvBlockTable,
       activeRows, lastReqIds, slotToToken, priority, freeMask, freeStack, freeCount, clock,
-      currentSlots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd};
+      currentSlots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd, probeThresholds, probeStats};
   const int64_t sizes[][2] = {{requests, 0}, {rows, 0}, {rows, 0}, {rows, 0}, {requests, -1}, {1, 0},
       {requests, 0}, {requests, capacity}, {requests, capacity}, {requests, capacity}, {requests, capacity},
       {requests, 0}, {requests, 0}, {rows, kSparseCount}, {requests, 0},
       {requests, maxQueries*kSparseCount}, {requests, maxQueries*kSparseCount}, {requests, maxToken},
-      {requests, 0}, {requests, 0}};
+      {requests, 0}, {requests, 0}, {rows, 0}, {rows, contract::PROBE_STAT_COLUMNS}};
   const at::Tensor indexerInputs[] = {query, key, weights, queryDequantScale, actualSeqLengthsQuery,
                                      actualSeqLengthsKey, indexerBlockTable};
   for (size_t i = 0; i < std::size(inputs); ++i) {
-    const auto dtype = (i == 0 || i == 6 || i == 8 || i == 12) ? at::kLong : at::kInt;
+    const auto dtype = i == 20 ? at::kFloat : (i == 0 || i == 6 || i == 8 || i == 12) ? at::kLong : at::kInt;
     const int64_t rank = sizes[i][1] == 0 ? 1 : 2;
     CheckTensor(inputs[i], "request state", dtype, rank, device);
     TORCH_CHECK(inputs[i].is_contiguous() && inputs[i].size(0) == sizes[i][0] &&
@@ -136,18 +138,19 @@ inline at::Tensor npu_quant_lightning_indexer_sparse_kv(
     const at::Tensor& priority, const at::Tensor& freeMask, const at::Tensor& freeStack,
     const at::Tensor& freeCount, const at::Tensor& clock, const at::Tensor& currentSlots, const at::Tensor& missCount,
     const at::Tensor& missTokens, const at::Tensor& missSlots, const at::Tensor& tokenToSlot,
-    const at::Tensor& status, const at::Tensor& residentEnd, int64_t capacity,
-    int64_t maxToken, int64_t blockSize, int64_t hostNumBlocks, int64_t maxQueries) {
+    const at::Tensor& status, const at::Tensor& residentEnd,
+    const at::Tensor& probeThresholds, const at::Tensor& probeStats, int64_t capacity,
+    int64_t maxToken, int64_t blockSize, int64_t hostNumBlocks, int64_t maxQueries, int64_t probeMode) {
   qli_sparse_kv::detail::ValidateInputs(
       query, key, weights, queryDequantScale, actualSeqLengthsQuery, actualSeqLengthsKey, indexerBlockTable, reqIds,
       stablePrefixLens, visibleSeqLens, tokenToReq, kvBlockTable, activeRows, lastReqIds, slotToToken, priority,
       freeMask, freeStack, freeCount, clock, currentSlots, missCount, missTokens, missSlots, tokenToSlot,
-      status, residentEnd, capacity, maxToken, blockSize, hostNumBlocks, maxQueries);
+      status, residentEnd, probeThresholds, probeStats, capacity, maxToken, blockSize, hostNumBlocks, maxQueries, probeMode);
   at::Tensor canonicalKeyScale =
       qli_sparse_kv::detail::ValidateAndNormalizeKeyScale(keyDequantScale, key, query.device());
 
   for (const auto& state : {lastReqIds, slotToToken, priority, freeMask, freeStack, freeCount, clock,
-                            currentSlots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd}) {
+                            currentSlots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd, probeStats}) {
     const auto a = reinterpret_cast<uintptr_t>(state.data_ptr());
     const auto b = reinterpret_cast<uintptr_t>(canonicalKeyScale.data_ptr());
     TORCH_CHECK(a + state.nbytes() <= b || b + canonicalKeyScale.nbytes() <= a,
@@ -170,9 +173,9 @@ inline at::Tensor npu_quant_lightning_indexer_sparse_kv(
   EXEC_NPU_CMD(aclnnQuantLightningIndexerSparseKv, query, key, weights, queryDequantScale, canonicalKeyScale,
                actualSeqLengthsQuery, actualSeqLengthsKey, indexerBlockTable, reqIds, stablePrefixLens, visibleSeqLens,
                tokenToReq, kvBlockTable, activeRows, lastReqIds, slotToToken, priority, freeMask, freeStack,
-               freeCount, clock, currentSlots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd, queryQuantMode, keyQuantMode, layoutQuery, layoutKey,
+               freeCount, clock, currentSlots, missCount, missTokens, missSlots, tokenToSlot, status, residentEnd, probeThresholds, probeStats, queryQuantMode, keyQuantMode, layoutQuery, layoutKey,
                sparseCount, sparseMode, preTokens, nextTokens, keyStride0, keyScaleStride0, capacity, maxToken,
-               blockSize, hostNumBlocks, maxQueries, sparseIndices);
+               blockSize, hostNumBlocks, maxQueries, probeMode, sparseIndices);
   return sparseIndices;
 }
 

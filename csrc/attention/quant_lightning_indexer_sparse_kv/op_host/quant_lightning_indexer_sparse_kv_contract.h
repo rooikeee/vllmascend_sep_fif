@@ -8,6 +8,8 @@ constexpr uint32_t QLI_UB_SMALL_T_BYTES = 150528U;
 constexpr uint32_t QLI_UB_LARGE_T_BYTES = 186880U;
 constexpr uint32_t MAX_QUERY_ROWS = 16U;
 constexpr uint32_t MAX_CAPACITY = 1U << 24;
+constexpr int32_t PROBE_MAX_MODE = 2;
+constexpr int32_t PROBE_STAT_COLUMNS = 3;
 
 constexpr uint32_t DynamicUbBytes(uint32_t tokenCount) {
   return tokenCount > 64U ? QLI_UB_LARGE_T_BYTES : QLI_UB_SMALL_T_BYTES;

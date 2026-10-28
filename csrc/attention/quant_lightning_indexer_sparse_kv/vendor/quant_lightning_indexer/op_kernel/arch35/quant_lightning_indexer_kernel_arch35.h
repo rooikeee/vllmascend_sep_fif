@@ -61,6 +61,7 @@ public:
                                 __gm__ uint8_t* actualSeqLengthsK, __gm__ uint8_t* blockTable,
                                 __gm__ uint8_t* sparseIndices, __gm__ uint8_t* workspace,
                                 const QuantLightningIndexerSparseKvTilingData* __restrict tiling, TPipe* tPipe);
+    __aicore__ inline void InitBlockMissProbe(const BlockMissProbeContext& context);
     __aicore__ inline void PlanRequests(const request_plan::Context& context, const request_plan::Shape& shape);
     __aicore__ inline void Process();
 
@@ -357,6 +358,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::DealActSeqLenIsZero(ui
     }
     LIV2Common::DealActSeqLenIsZero<QLICommon::LI_LAYOUT::TND, QLICommon::LI_LAYOUT::BSND>(
         bIdx, n2Idx, s1Start, tBase, tempLoopInfo.actS1Size, constInfo.sparseCount, constInfo, vectorService);
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::InitBlockMissProbe(const BlockMissProbeContext& context)
+{
+    if ASCEND_IS_AIV {
+        vectorService.InitBlockMissProbe(context);
+    }
 }
 
 template <typename QLIT>

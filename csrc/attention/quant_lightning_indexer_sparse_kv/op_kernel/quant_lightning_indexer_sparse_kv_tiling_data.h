@@ -32,9 +32,10 @@ struct alignas(8) QuantLightningIndexerSparseKvTilingData {
     int64_t hostNumBlocks;
     int32_t planBlockSize;
     int32_t maxQueries;
+    int32_t probeMode;
 };
 
-static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 120);
+static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 128);
 static_assert(offsetof(QuantLightningIndexerSparseKvTilingData, maxRows) == 56);
 static_assert(offsetof(QuantLightningIndexerSparseKvTilingData, planBlockSize) == 112);
 

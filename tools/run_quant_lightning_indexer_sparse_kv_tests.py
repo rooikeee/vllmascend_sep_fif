@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_TESTS = (
+    "tests/ut/kv_offload/test_fused_block_miss_probe.py",
     "tests/ut/kv_offload/test_quant_lightning_indexer_request_state.py",
     "tests/ut/kv_offload/test_quant_lightning_indexer_sparse_kv_tiling.py",
     "tests/ut/kv_offload/test_quant_lightning_indexer_sparse_kv_inline_source.py",

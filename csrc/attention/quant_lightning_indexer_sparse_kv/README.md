@@ -1,5 +1,10 @@
 # QuantLightningIndexerSparseKv
 
+This branch adds an optional read-only reverse-map probe after each 128-token
+score block. The final TopK planner is unchanged. See the
+[probe experiment](../../../docs/950pr_fused_block_miss_probe.md) for three-mode
+comparisons, the new ABI and a fused-only build/test command.
+
 Only this fused operator is an optimization and acceptance target. See
 [build and test instructions](../../../README.request-shared-950.md).
 

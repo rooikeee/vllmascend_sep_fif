@@ -1,5 +1,9 @@
 # 950PR 融合 indexer 优化与验收
 
+> 当前分支新增 score block 后只读查询实验，ABI 增加 `probe_thresholds`、`probe_stats`、
+> `probe_mode`；默认关闭。该实验不做搬运，只编译融合算子，入口见
+> [block miss 查询实验](docs/950pr_fused_block_miss_probe.md)。下文真实 KV 验收仍需 transfer。
+
 **只优化融合算子 `QuantLightningIndexerSparseKv`，测试和性能验收也只针对融合算子。**
 不再以独立 `SparseKvPlan` / `SparseKvRequestPlan` 作为优化或验收入口。
 `SparseKvTransfer` 仅作为已有 KV 搬运组件，在融合输出的链路检查中复用。
@@ -51,6 +55,21 @@ IndexCache 跨层状态与失败传播尚未迁移；不能把新 ABI 直接接�
 目标：Ascend 950PR、CANN 9.1、匹配的 Torch/torch-npu。先 source CANN 的
 `set_env.sh` 并激活 Python 环境。工具链支持目标时，910 主机可以交叉编译 950
 二进制；**910 不能执行此算子，交叉编译成功不等于 950 验证通过。**
+
+下面的 `--ops` 列出两个设备算子，各自负责不同步骤：
+
+| 编译目标 | 用途 |
+| --- | --- |
+| `quant_lightning_indexer_sparse_kv` | 本次优化的融合算子：score、TopK、反向表判定、去重、free 栈分配和淘汰，在一次 kernel 内完成。 |
+| `sparse_kv_transfer` | 已有的搬运算子：按融合算子输出的 miss 清单，将真实 KV 从 Host 搬回 NPU。 |
+
+把 transfer 一起打包，是因为下面的设备验收还检查真实 KV 内容；融合算子本身只输出
+索引、槽位和搬运计划。这里没有编译或调用独立 `sparse_kv_plan` / `sparse_kv_request_plan`。
+若只编译融合算子，可把 `--ops` 改成 `quant_lightning_indexer_sparse_kv`；运行下面的
+完整设备验收时，环境仍须提供配套的 `SparseKvTransfer`。
+
+`build_fused_indexer_test_binding.py` 编译的是 Host 侧 Torch 调用桥接，用于调用上述
+设备算子，不是另一个设备 kernel。
 
 从旧 checkout 更新时，先将 `csrc/build` 移到一个不存在的备份目录，避免复用旧 ABI。
 从仓库根目录执行：

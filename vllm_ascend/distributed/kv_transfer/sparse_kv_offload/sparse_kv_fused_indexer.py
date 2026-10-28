@@ -8,6 +8,7 @@ This operator harness does not adapt the legacy serving row-major hot pool.
 
 import torch
 
+_PROBE_STAT_COLUMNS = 3
 _MAX_QUERY_ROWS = 16
 _TOPK = 2048
 _BLOCK_SIZE = 128
@@ -52,6 +53,9 @@ class SparseKVFusedIndexer:
         self.resident_end = torch.zeros(max_requests, **i32)
         self.status = torch.zeros(max_requests, **i32)
         self.active_rows = torch.zeros(1, **i32)
+        self.probe_thresholds = torch.full((max_rows,), float("inf"), dtype=torch.float32, device=device)
+        self.probe_stats = torch.zeros((max_rows, _PROBE_STAT_COLUMNS), **i32)
+        self.probe_mode = 0
         # Transfer rows are requests, so its existing row*C addressing is shared.
         self.transfer_requests = torch.arange(max_requests, **i32)
         self.transfer_active = torch.full((1,), max_requests, **i32)
@@ -76,6 +80,7 @@ class SparseKVFusedIndexer:
         visible_seq_lens,
         token_to_req,
         block_table,
+        update_page_table=True,
     ):
         if query.shape[0] != self.max_rows:
             raise ValueError("Query rows must match the captured fused state")
@@ -108,15 +113,19 @@ class SparseKVFusedIndexer:
             self.token_to_slot,
             self.status,
             self.resident_end,
+            self.probe_thresholds,
+            self.probe_stats,
             self.capacity,
             self.max_token,
             self.block_size,
             self.host_num_blocks,
             self.max_queries,
+            self.probe_mode,
         )
         # Padding has -1 indices; clamp its page-table owner to an allocated row.
-        torch.clamp(token_to_req, 0, self.max_requests - 1, out=self.safe_requests)
-        torch.index_select(self.request_page_table, 0, self.safe_requests, out=self.attention_page_table)
+        if update_page_table:
+            torch.clamp(token_to_req, 0, self.max_requests - 1, out=self.safe_requests)
+            torch.index_select(self.request_page_table, 0, self.safe_requests, out=self.attention_page_table)
         return indices
 
     def transfer(

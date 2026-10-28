@@ -31,6 +31,7 @@ EXPECTED_FIELDS = (
     ("int64_t", "hostNumBlocks", 104),
     ("int32_t", "planBlockSize", 112),
     ("int32_t", "maxQueries", 116),
+    ("int32_t", "probeMode", 120),
 )
 
 
@@ -114,7 +115,7 @@ struct alignas(8) HostFieldOrderMirror {{
 }};
 
 static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == sizeof(HostFieldOrderMirror));
-static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 120);
+static_assert(sizeof(QuantLightningIndexerSparseKvTilingData) == 128);
 static_assert(alignof(QuantLightningIndexerSparseKvTilingData) == 8);
 {offset_checks}
 {type_checks}

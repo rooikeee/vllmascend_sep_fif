@@ -84,6 +84,9 @@ public:
         AddMutableInt32Input(*this, "token_to_slot");
         AddMutableInt32Input(*this, "status");
         AddMutableInt32Input(*this, "resident_end");
+        this->Input("probe_thresholds").ParamType(REQUIRED).DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND}).AutoContiguous();
+        AddMutableInt32Input(*this, "probe_stats");
 
         this->Output("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND});
@@ -103,6 +106,7 @@ public:
         this->Attr("host_num_blocks").AttrType(REQUIRED).Int();
 
         this->Attr("max_queries").AttrType(REQUIRED).Int();
+        this->Attr("probe_mode").AttrType(REQUIRED).Int(0);
 
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)
