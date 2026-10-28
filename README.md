@@ -1,3 +1,5 @@
+> 950PR request-shared miss planner: see [build and test instructions](README.request-shared-950.md).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/logos/vllm-ascend-logo-text-dark.png">
