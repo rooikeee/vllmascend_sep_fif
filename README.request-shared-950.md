@@ -2,6 +2,14 @@
 
 分支：`perf/950pr-request-shared-planner`。基线：`wzj_kv_offload_opt@fcf6cd850`。
 
+发布位置：`rooikeee/vllmascend_sep_fif` fork；上游为`AmourSec/vllmascend_sep_fif`。
+
+```bash
+git clone --single-branch --branch perf/950pr-request-shared-planner \
+  https://github.com/rooikeee/vllmascend_sep_fif.git vllmascend-request-shared
+cd vllmascend-request-shared
+```
+
 这版新增实验算子 `SparseKvRequestPlan`，供950PR上编译、正确性检查和后续性能测量。
 MTP3四行共享请求缓存，union miss只搬一次；用free表/栈和时间戳优先级替换新路径
 中的完整LRU顺序维护。没有增加覆盖整个上下文的稠密token映射。
